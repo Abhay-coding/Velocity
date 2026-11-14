@@ -3,7 +3,7 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use tokio::process::Command;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use velocity_core::{
     error::{VelocityError, VelocityResult},
@@ -116,8 +116,6 @@ impl EverythingCliAdapter {
 impl IndexProvider for EverythingCliAdapter {
     async fn initialize(&self) -> VelocityResult<()> {
         // Check if es.exe exists and is executable
-        // We just verify the file exists and is executable, without running it
-        // because es.exe -h returns exit code 1 even when successful
         if !self.es_path.exists() {
             return Err(VelocityError::EverythingNotFound(format!(
                 "es.exe not found at: {}",
@@ -159,6 +157,7 @@ impl IndexProvider for EverythingCliAdapter {
         let start = Instant::now();
         let args = self.build_search_args(&query);
 
+        info!("Executing es.exe with args: {:?}", args);
         debug!("Executing es.exe with args: {:?}", args);
 
         let output = tokio::time::timeout(self.timeout, async {
@@ -173,41 +172,74 @@ impl IndexProvider for EverythingCliAdapter {
         .map_err(|_| VelocityError::IndexProvider("Search timeout".to_string()))?
         .map_err(|e| VelocityError::IndexProvider(format!("Failed to spawn es.exe: {}", e)))?;
 
+        let exit_code = output.status.code().unwrap_or(-1);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        info!("es.exe exit code: {}, stdout len: {}, stderr len: {}", exit_code, stdout.len(), stderr.len());
+        debug!("es.exe stdout: {}", stdout);
+        debug!("es.exe stderr: {}", stderr);
+
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            warn!("es.exe search failed: {}", stderr);
+            warn!("es.exe search failed with exit code {}: {}", exit_code, stderr);
             return Err(VelocityError::IndexProvider(format!(
-                "Search failed: {}",
-                stderr
+                "Search failed (exit code {}): {}",
+                exit_code, stderr
             )));
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
         let results = self.parse_output(&stdout)?;
+        let results_count = results.len();
 
-        let total_count = results.len();
+        // For total_count, we need to get the actual total from Everything
+        // We can do a separate count query, or use the results length if it's less than max_results
+        // If results.len() < max_results, then total_count = results.len()
+        // Otherwise, we don't know the exact total without a separate count query
+        let total_count = if results_count < query.max_results {
+            results_count
+        } else {
+            // Results are capped at max_results, we can't know exact total without another query
+            // Return the count we got as a minimum
+            results_count
+        };
+
         let query_time_ms = start.elapsed().as_millis() as u64;
+
+        info!("Search completed: {} results (returned), {}ms", results_count, query_time_ms);
 
         Ok(SearchResults {
             results,
             total_count,
             query_time_ms,
-            partial: false,
+            partial: results_count >= query.max_results,
         })
     }
 
     async fn stats(&self) -> VelocityResult<IndexStats> {
         // Get total count by searching with empty query
+        // Use a reasonable max_results to avoid timeout
+        // If results.len() < max_results, we have the exact count
+        // If results.len() == max_results, there are at least that many
+        let max_results = 10000; // Reasonable limit to avoid timeout
         let query = SearchQuery {
             text: String::new(),
-            max_results: 1,
+            max_results,
             offset: 0,
         };
 
         let results = self.search(query).await?;
+        let total_count = results.total_count;
+
+        // If we got fewer than max_results, we have the exact count
+        // If we got exactly max_results, there are at least that many
+        let total_files = if total_count < max_results {
+            total_count as u64
+        } else {
+            total_count as u64 // At least this many
+        };
 
         Ok(IndexStats {
-            total_files: results.total_count as u64,
+            total_files,
             total_size: 0, // Not available from es.exe easily
             index_size_bytes: 0,
             last_updated: None,
@@ -218,20 +250,16 @@ impl IndexProvider for EverythingCliAdapter {
     }
 
     async fn reindex(&self) -> VelocityResult<()> {
-        // Everything re-indexes automatically via USN journal
-        // We can trigger a forced rebuild via IPC if needed
         info!("Reindex requested - Everything handles this automatically");
         Ok(())
     }
 
     async fn pause_indexing(&self) -> VelocityResult<()> {
-        // Not directly supported via CLI
         warn!("Pause indexing not supported via Everything CLI");
         Ok(())
     }
 
     async fn resume_indexing(&self) -> VelocityResult<()> {
-        // Not directly supported via CLI
         warn!("Resume indexing not supported via Everything CLI");
         Ok(())
     }
@@ -239,11 +267,11 @@ impl IndexProvider for EverythingCliAdapter {
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             name: "Everything CLI".to_string(),
-            supports_realtime: true, // Via USN journal
-            supports_operators: true, // ext:, path:, size:, etc.
+            supports_realtime: true,
+            supports_operators: true,
             supports_content_search: false,
             supports_preview: false,
-            requires_admin: false, // es.exe runs as user, Everything service runs as SYSTEM
+            requires_admin: false,
             version: "1.0".to_string(),
         }
     }

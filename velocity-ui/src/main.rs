@@ -1,19 +1,31 @@
-use slint::{ComponentHandle, Model, ModelRc, VecModel};
+use slint::{ComponentHandle, ModelRc, VecModel, invoke_from_event_loop};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
 use velocity_core::{
     config::Config,
-    error::{VelocityError, VelocityResult},
-    index_provider::{IndexProvider, SearchQuery, SearchResult, SearchResults},
+    error::VelocityResult,
+    index_provider::{IndexProvider, SearchQuery},
 };
 use velocity_everything::EverythingCliAdapter;
 
 slint::include_modules!();
 
-fn format_size(bytes: u64) -> String {
+#[derive(Debug)]
+enum UiCommand {
+    SetResults(Vec<SearchResultItem>),
+    SetStatus(String),
+    SetSearching(bool),
+    SetResultsCount(i32),
+    ClearResults,
+    ShowWindow,
+    HideWindow,
+}
+
+fn format_bytes(bytes: u64) -> String {
     const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
     let mut size = bytes as f64;
     let mut unit = 0;
@@ -29,145 +41,199 @@ fn format_size(bytes: u64) -> String {
 }
 
 fn format_timestamp(unix_secs: u64) -> String {
-    use chrono::{DateTime, Local, TimeZone};
+    use chrono::{DateTime, Local};
     DateTime::from_timestamp(unix_secs as i64, 0)
         .map(|dt| dt.with_timezone(&Local).format("%Y-%m-%d %H:%M").to_string())
         .unwrap_or_default()
 }
 
-// Convert velocity_core::SearchResult to Slint-generated SearchResultItem
-fn to_slint_result(r: SearchResult) -> SearchResultItem {
-    let size_str = if r.is_directory {
-        String::new()
-    } else {
-        format_size(r.size)
-    };
-    let modified_str = if r.modified > 0 {
-        format_timestamp(r.modified)
-    } else {
-        String::new()
-    };
-    SearchResultItem {
-        name: r.name.into(),
-        path: r.path.to_string_lossy().to_string().into(),
-        size: size_str.into(),
-        modified: modified_str.into(),
-        is_directory: r.is_directory,
-    }
-}
-
-#[derive(Debug)]
-enum UiMessage {
-    SearchResults(SearchResults),
-    SearchError(String),
-    Stats(velocity_core::index_provider::IndexStats),
-    Status(String),
-    ShowWindow,
-    HideWindow,
-    BackendError(String),
-}
-
-#[tokio::main]
-async fn main() -> VelocityResult<()> {
+fn main() -> VelocityResult<()> {
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter("velocity=debug,info")
         .init();
 
-    info!("Starting Velocity Search...");
+    info!("Starting Velocity Search (Dynamic Search Test)...");
 
-    // Load configuration
-    let config = Config::load()?;
-    info!("Configuration loaded");
+    // Create a tokio runtime in a separate thread for async operations
+    // Use a oneshot channel to pass the runtime handle
+    let (runtime_tx, runtime_rx) = std::sync::mpsc::channel();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
 
-    // Initialize index provider (Everything CLI adapter)
-    let provider = EverythingCliAdapter::new(None)
-        .with_max_results(config.ui.max_results)
-        .with_timeout(Duration::from_secs(10));
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create tokio runtime");
 
-    // Try to initialize provider - don't crash if it fails
-    let provider = Arc::new(provider);
-    let provider_initialized = match provider.initialize().await {
-        Ok(()) => {
-            info!("Index provider initialized");
-            // Get initial stats
-            if let Ok(stats) = provider.stats().await {
-                info!("Index stats: {} files", stats.total_files);
+        // Send the handle so we can spawn tasks from the main thread
+        let handle = rt.handle().clone();
+        let _ = runtime_tx.send(handle);
+
+        // Signal that runtime is ready
+        let _ = ready_tx.send(());
+
+        // Run the runtime forever (this blocks the thread)
+        rt.block_on(async {
+            // Keep alive forever
+            std::future::pending::<()>().await;
+        });
+    });
+
+    // Wait for runtime to be ready
+    ready_rx.recv().expect("Runtime thread failed to start");
+    let runtime_handle = runtime_rx.recv().expect("Failed to receive runtime handle");
+
+    // Run async initialization on the tokio runtime
+    let (init_tx, init_rx) = std::sync::mpsc::channel();
+    runtime_handle.spawn(async move {
+        // Load configuration
+        let config = match Config::load() {
+            Ok(c) => {
+                info!("Configuration loaded");
+                c
             }
-            true
-        }
-        Err(e) => {
-            error!("Failed to initialize index provider: {}", e);
-            false
-        }
-    };
+            Err(e) => {
+                error!("Failed to load config: {}", e);
+                let _ = init_tx.send(Err(e));
+                return;
+            }
+        };
 
-    // Create Slint UI
+        // Initialize index provider (Everything CLI adapter)
+        let provider = EverythingCliAdapter::new(None)
+            .with_max_results(config.ui.max_results)
+            .with_timeout(Duration::from_secs(10));
+
+        let provider = Arc::new(provider);
+        let provider_initialized = match provider.initialize().await {
+            Ok(()) => {
+                info!("Index provider initialized");
+                if let Ok(stats) = provider.stats().await {
+                    info!("Index stats: {} files", stats.total_files);
+                }
+                true
+            }
+            Err(e) => {
+                error!("Failed to initialize index provider: {}", e);
+                false
+            }
+        };
+
+        let _ = init_tx.send(Ok((config, provider, provider_initialized)));
+    });
+
+    // Wait for initialization to complete
+    let (config, provider, _provider_initialized) = init_rx.recv().expect("Init channel closed")?;
+
+    // Create Slint UI on the main thread
     let ui = SearchBar::new()?;
 
     // Set initial UI state
     ui.set_placeholder("Search files...".into());
     ui.set_hotkey_hint(config.hotkey.hotkey_hint().into());
+    ui.set_searching(false);
+    ui.set_results_count(0);
+    ui.set_status_text("Ready".into());
 
-    // Channel for UI updates from async tasks
-    let (ui_tx, mut ui_rx) = mpsc::channel::<UiMessage>(100);
-    let ui_weak = ui.as_weak();
+    // IMMEDIATELY SHOW WINDOW
+    ui.show()?;
+    info!("Window shown immediately");
 
-    // Spawn UI message handler
-    let ui_handle = ui_weak.clone();
-    tokio::spawn(async move {
-        while let Some(msg) = ui_rx.recv().await {
-            if let Some(ui) = ui_handle.upgrade() {
-                match msg {
-                    UiMessage::SearchResults(results) => {
-                        let items: Vec<SearchResultItem> = results.results.into_iter().map(to_slint_result).collect();
-                        ui.set_results_count(items.len() as i32);
-                        ui.set_searching(false);
-                        ui.set_status_text(format!("{} results in {}ms", items.len(), results.query_time_ms).into());
+    // Channel for UI updates from background tasks
+    let (ui_tx, mut ui_rx) = mpsc::channel::<UiCommand>(100);
 
-                        // Update results model
-                        let model = ModelRc::new(VecModel::from(items));
-                        ui.set_search_results(model);
-                    }
-                    UiMessage::SearchError(err) => {
-                        ui.set_searching(false);
-                        ui.set_status_text(format!("Error: {}", err).into());
-                        error!("Search error: {}", err);
-                    }
-                    UiMessage::Stats(stats) => {
-                        ui.set_status_text(format!("{} files indexed", stats.total_files).into());
-                    }
-                    UiMessage::Status(text) => {
-                        ui.set_status_text(text.into());
-                    }
-                    UiMessage::ShowWindow => {
-                        ui.show();
-                    }
-                    UiMessage::HideWindow => {
-                        ui.hide();
-                    }
-                    UiMessage::BackendError(err) => {
-                        ui.set_status_text(format!("Backend error: {}", err).into());
-                        ui.set_searching(false);
-                        // Show error in results area as well
-                        let empty_model: Vec<SearchResultItem> = Vec::new();
-                        let model = ModelRc::new(VecModel::from(empty_model));
-                        ui.set_search_results(model);
-                        ui.set_results_count(0);
+    // Atomic counter for search ID to prevent race conditions
+    let search_id = Arc::new(AtomicU64::new(0));
+
+    // Spawn UI command handler on the main thread (via event loop)
+    let ui_handle = ui.as_weak();
+    let ui_handle_for_commands = ui_handle.clone();
+    runtime_handle.spawn(async move {
+        while let Some(cmd) = ui_rx.recv().await {
+            let ui_weak = ui_handle_for_commands.clone();
+            let _ = invoke_from_event_loop(move || {
+                if let Some(ui) = ui_weak.upgrade() {
+                    match cmd {
+                        UiCommand::SetResults(items) => {
+                            ui.set_results_count(items.len() as i32);
+                            ui.set_searching(false);
+                            let model = ModelRc::new(VecModel::from(items));
+                            ui.set_search_results(model);
+                        }
+                        UiCommand::SetStatus(text) => {
+                            ui.set_status_text(text.into());
+                        }
+                        UiCommand::SetSearching(searching) => {
+                            ui.set_searching(searching);
+                        }
+                        UiCommand::SetResultsCount(count) => {
+                            ui.set_results_count(count);
+                        }
+                        UiCommand::ClearResults => {
+                            ui.set_results_count(0);
+                            ui.set_searching(false);
+                            ui.set_status_text("".into());
+                            ui.set_search_results(ModelRc::new(VecModel::from(Vec::<SearchResultItem>::new())));
+                        }
+                        UiCommand::ShowWindow => {
+                            let _ = ui.show();
+                        }
+                        UiCommand::HideWindow => {
+                            let _ = ui.hide();
+                        }
                     }
                 }
-            }
+            });
         }
     });
 
-    // If backend failed to initialize, show error in UI
-    if !provider_initialized {
-        let _ = ui_tx.send(UiMessage::BackendError(
-            "Everything search backend not found. Please install Everything from voidtools.com".into()
-        )).await;
-        // Still show the window so user can see the error
-        let _ = ui_tx.send(UiMessage::ShowWindow).await;
-    }
+    // INJECT TEST RESULTS FROM RUST ON STARTUP - verify Rust-to-Slint binding
+    let ui_tx_clone = ui_tx.clone();
+    runtime_handle.spawn(async move {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let test_items = vec![
+            SearchResultItem {
+                name: "Rust-Generated: Assignment-8.pdf".into(),
+                path: "C:\\Documents\\Assignment-8.pdf".into(),
+                size: "2.5 MB".into(),
+                modified: "2024-01-13 09:15".into(),
+                is_directory: false,
+            },
+            SearchResultItem {
+                name: "Rust-Generated: Resume.docx".into(),
+                path: "C:\\Users\\Resume.docx".into(),
+                size: "1.2 MB".into(),
+                modified: "2024-01-10 14:30".into(),
+                is_directory: false,
+            },
+            SearchResultItem {
+                name: "Rust-Generated: Project Notes.txt".into(),
+                path: "C:\\Projects\\Notes.txt".into(),
+                size: "15 KB".into(),
+                modified: "2024-01-12 10:45".into(),
+                is_directory: false,
+            },
+            SearchResultItem {
+                name: "Rust-Generated: Documents".into(),
+                path: "C:\\Documents".into(),
+                size: "".into(),
+                modified: "2024-01-01 09:00".into(),
+                is_directory: true,
+            },
+            SearchResultItem {
+                name: "Rust-Generated: Downloads".into(),
+                path: "C:\\Users\\Downloads".into(),
+                size: "".into(),
+                modified: "2024-01-05 16:20".into(),
+                is_directory: true,
+            },
+        ];
+
+        let _ = ui_tx_clone.send(UiCommand::SetResults(test_items)).await;
+        let _ = ui_tx_clone.send(UiCommand::SetStatus("Rust-generated results injected!".to_string())).await;
+    });
 
     // Set up global hotkey (Alt+Space) using rdev
     let ui_tx_hotkey = ui_tx.clone();
@@ -180,8 +246,7 @@ async fn main() -> VelocityResult<()> {
                     if key == Key::Alt {
                         alt_pressed = true;
                     } else if key == Key::Space && alt_pressed {
-                        // Alt+Space pressed
-                        let _ = ui_tx_hotkey.send(UiMessage::ShowWindow);
+                        let _ = ui_tx_hotkey.blocking_send(UiCommand::ShowWindow);
                     }
                 }
                 EventType::KeyRelease(key) => {
@@ -196,24 +261,41 @@ async fn main() -> VelocityResult<()> {
         }
     });
 
-    // Set up search callback
-    let ui_tx_clone = ui_tx.clone();
-    let provider_clone = provider.clone();
-    let config_clone = config.clone();
+    // Search callback - REAL SEARCH PIPELINE
+    let provider = provider.clone();
+    let ui_tx_search = ui_tx.clone();
+    let search_id = search_id.clone();
 
     ui.on_search_requested(move |query_text| {
         let query = query_text.to_string();
+        let ui_tx = ui_tx_search.clone();
+        let provider = provider.clone();
+        let search_id = search_id.clone();
+
         if query.trim().is_empty() {
+            info!("Empty query, clearing results");
+            let _ = ui_tx.blocking_send(UiCommand::ClearResults);
             return;
         }
 
-        let provider = provider_clone.clone();
-        let ui_tx = ui_tx_clone.clone();
-        let debounce_ms = config_clone.ui.hover_delay_ms; // reuse for search debounce
+        let this_search_id = search_id.fetch_add(1, Ordering::SeqCst) + 1;
+        info!("Search #{}: '{}'", this_search_id, query);
 
-        // Debounce search
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(debounce_ms)).await;
+        let _ = ui_tx.blocking_send(UiCommand::SetSearching(true));
+        let _ = ui_tx.blocking_send(UiCommand::SetStatus(format!("Searching for '{}'...", query)));
+
+        runtime_handle.spawn(async move {
+            info!("Search #{} task started, waiting for debounce (300ms)...", this_search_id);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+
+            // Check if a newer search has superseded this one
+            let current_search_id = search_id.load(Ordering::SeqCst);
+            if current_search_id != this_search_id {
+                info!("Search #{} superseded by newer search #{}, aborting", this_search_id, current_search_id);
+                return;
+            }
+
+            info!("Search #{} debounce complete, executing search...", this_search_id);
 
             let search_query = SearchQuery {
                 text: query.clone(),
@@ -221,25 +303,60 @@ async fn main() -> VelocityResult<()> {
                 offset: 0,
             };
 
-            ui_tx.send(UiMessage::Status("Searching...".into())).await.ok();
-            ui_tx.send(UiMessage::ShowWindow).await.ok();
-
+            info!("Search #{} executing provider.search...", this_search_id);
             match provider.search(search_query).await {
                 Ok(results) => {
-                    ui_tx.send(UiMessage::SearchResults(results)).await.ok();
+                    // Check again if this search is still the latest
+                    let current_search_id = search_id.load(Ordering::SeqCst);
+                    if current_search_id != this_search_id {
+                        info!("Search #{} superseded after completion, discarding results", this_search_id);
+                        return;
+                    }
+
+                    let results_count = results.results.len();
+                    let query_time_ms = results.query_time_ms;
+
+                    let items: Vec<SearchResultItem> = results.results.into_iter().map(|r| SearchResultItem {
+                        name: r.name.into(),
+                        path: r.path.to_string_lossy().to_string().into(),
+                        size: if r.is_directory { String::new().into() } else { format_bytes(r.size).into() },
+                        modified: if r.modified > 0 {
+                            format_timestamp(r.modified).into()
+                        } else {
+                            String::new().into()
+                        },
+                        is_directory: r.is_directory,
+                    }).collect();
+
+                    let _ = ui_tx.send(UiCommand::SetResults(items)).await;
+                    let _ = ui_tx.send(UiCommand::SetStatus(format!("{} results in {}ms", results_count, query_time_ms))).await;
                 }
                 Err(e) => {
-                    ui_tx.send(UiMessage::SearchError(e.to_string())).await.ok();
+                    error!("Search #{} error: {}", this_search_id, e);
+                    let _ = ui_tx.send(UiCommand::SetSearching(false)).await;
+                    let _ = ui_tx.send(UiCommand::SetStatus(format!("Error: {}", e))).await;
                 }
             }
         });
     });
 
-    // Set up result selection
-    let ui_tx_select = ui_tx.clone();
+    // Set up hotkey callback
+    let ui_tx_hotkey_cb = ui_tx.clone();
+    ui.on_hotkey_pressed(move || {
+        info!("Hotkey pressed callback fired");
+        let _ = ui_tx_hotkey_cb.blocking_send(UiCommand::ShowWindow);
+    });
+
+    // Set up escape
+    let ui_tx_escape = ui_tx.clone();
+    ui.on_escape_pressed(move || {
+        let _ = ui_tx_escape.blocking_send(UiCommand::HideWindow);
+    });
+
+    // Result selection
     ui.on_result_selected(move |path_text| {
         let path = path_text.to_string();
-        info!("Opening: {}", path);
+        info!("Result selected: {}", path);
 
         // Try to open with default application
         #[cfg(target_os = "windows")]
@@ -254,54 +371,11 @@ async fn main() -> VelocityResult<()> {
         }
     });
 
-    // Set up hotkey (placeholder - would use global hotkey crate in production)
-    let ui_tx_hotkey = ui_tx.clone();
-    ui.on_hotkey_pressed(move || {
-        ui_tx_hotkey.try_send(UiMessage::ShowWindow).ok();
-    });
-
-    // Set up escape
-    let ui_tx_escape = ui_tx.clone();
-    ui.on_escape_pressed(move || {
-        ui_tx_escape.try_send(UiMessage::HideWindow).ok();
-    });
-
-    // Set up preview
-    let provider_preview = provider.clone();
-    let ui_tx_preview = ui_tx.clone();
-    ui.on_preview_requested(move |path_text| {
-        let path = path_text.to_string();
-        let provider = provider_preview.clone();
-        let ui_tx = ui_tx_preview.clone();
-
-        tokio::spawn(async move {
-            // For now, just show basic file info as preview
-            if let Ok(metadata) = std::fs::metadata(&path) {
-                let preview = format!(
-                    "Path: {}\nSize: {}\nModified: {}\nType: {}",
-                    path,
-                    format_size(metadata.len()),
-                    format_timestamp(
-                        metadata.modified()
-                            .ok()
-                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0)
-                    ),
-                    if metadata.is_dir() { "Directory" } else { "File" }
-                );
-                ui_tx.send(UiMessage::Status(preview)).await.ok();
-            }
-        });
-    });
-
-    // Run the UI event loop
+    // Run the UI event loop on the main thread
     info!("Starting UI event loop...");
     ui.run()?;
 
     // Shutdown
-    provider.shutdown().await?;
     info!("Velocity Search stopped");
-
     Ok(())
 }
