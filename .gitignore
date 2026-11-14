@@ -1,0 +1,55 @@
+# Rust target directory
+target/
+
+# Cargo lock file (optional - some projects commit it, some don't)
+Cargo.lock
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.lib
+*.dll
+*.exe
+*.pdb
+
+# Temporary files
+*.tmp
+*.temp
+
+# Log files
+*.log
+
+# Environment files
+.env
+.env.local
+
+# Test output
+coverage/
+*.profraw
+*.profdata
+
+# Clippy cache
+.clippy/
+
+# Rust analyzer cache
+rust-analyzer/
+
+# Cargo registry cache (if using offline mirror)
+.cargo/registry/
+
+# Slint build output (generated UI code)
+**/target/debug/build/velocity-ui-*/out/
+**/target/release/build/velocity-ui-*/out/
+
+# Backup files
+*.bak
+*.backup

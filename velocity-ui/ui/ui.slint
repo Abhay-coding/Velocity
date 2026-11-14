@@ -1,0 +1,280 @@
+struct SearchResultItem {
+    name: string,
+    path: string,
+    size: string,
+    modified: string,
+    is_directory: bool,
+}
+
+export component SearchBar inherits Window {
+    in property <string> placeholder: "Search files...";
+    in property <string> hotkey_hint: "Alt+Space";
+
+    // Theme colors (follow system)
+    in property <brush> bg_color: #fafafa;
+    in property <brush> text_color: #1a1a1a;
+    in property <brush> accent_color: #0078d4;
+    in property <brush> result_bg_hover: #e8f0fe;
+    in property <brush> result_bg_selected: #d6e4f0;
+    in property <brush> border_color: #e0e0e0;
+
+    // Search state
+    in property <string> search_text: "";
+    in property <int> selected_index: -1;
+    in property <int> results_count: 0;
+    in property <bool> searching: false;
+    in property <bool> show_preview: false;
+    in property <string> preview_text: "";
+    in property <string> preview_path: "";
+    in property <string> status_text: "";
+
+    // Search results model
+    in property <[SearchResultItem]> search_results;
+
+    callback search_requested(string);
+    callback result_selected(string);
+    callback hotkey_pressed();
+    callback escape_pressed();
+    callback preview_requested(string);
+
+    preferred-width: 640px;
+    preferred-height: 480px;
+
+    // Window background - not transparent
+    background: bg_color;
+
+    Rectangle {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        background: bg_color;
+        border-width: 1px;
+        border-color: border_color;
+        border-radius: 8px;
+        clip: true;
+
+        VerticalLayout {
+            x: 0;
+            y: 0;
+            width: parent.width;
+            height: parent.height;
+            spacing: 8px;
+            padding: 12px;
+
+            // Search input row
+            HorizontalLayout {
+                spacing: 8px;
+
+                // Search icon
+                Rectangle {
+                    width: 32px;
+                    height: 32px;
+                    background: transparent;
+                    Text {
+                        text: "🔍";
+                        font-size: 18px;
+                        color: #666;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                // Search input container with border
+                Rectangle {
+                    width: parent.width - 72px;
+                    height: 32px;
+                    background: #ffffff;
+                    border-width: 1px;
+                    border-color: border_color;
+                    border-radius: 4px;
+                    TextInput {
+                        x: 4px;
+                        y: 0;
+                        width: parent.width - 8px;
+                        height: 32px;
+                        text: search_text;
+                        font-size: 16px;
+                        color: text_color;
+                        horizontal-alignment: left;
+                        vertical-alignment: center;
+                        edited => {
+                            search_requested(self.text);
+                        }
+                    }
+                }
+
+                // Clear button
+                TouchArea {
+                    width: 32px;
+                    height: 32px;
+                    visible: search_text != "";
+                    clicked => {
+                        search_requested("");
+                    }
+                    Rectangle {
+                        width: 32px;
+                        height: 32px;
+                        background: transparent;
+                        Text {
+                            text: "✕";
+                            font-size: 16px;
+                            color: #666;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+
+            // Results list
+            Rectangle {
+                background: transparent;
+                border-width: 1px;
+                border-color: border_color;
+                border-radius: 4px;
+                height: 320px;
+                clip: true;
+
+                VerticalLayout {
+                    spacing: 2px;
+                    padding: 4px;
+
+                    // Render actual search results
+                    for result in search_results : Rectangle {
+                        height: 40px;
+                        background: result.is_directory ? #f0f4f8 : #ffffff;
+                        border-width: 1px;
+                        border-color: border_color;
+                        border-radius: 4px;
+                        clip: true;
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            padding: 8px;
+
+                            // File type icon
+                            Rectangle {
+                                width: 24px;
+                                height: 24px;
+                                background: result.is_directory ? accent_color : text_color;
+                                border-radius: 4px;
+                                Text {
+                                    text: result.is_directory ? "📁" : "📄";
+                                    font-size: 14px;
+                                    color: #ffffff;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+
+                            // File info
+                            VerticalLayout {
+                                spacing: 2px;
+                                Text {
+                                    text: result.name;
+                                    font-size: 13px;
+                                    color: text_color;
+                                    font-weight: 500;
+                                }
+                                HorizontalLayout {
+                                    spacing: 12px;
+                                    Text {
+                                        text: result.size;
+                                        font-size: 11px;
+                                        color: #888;
+                                    }
+                                    Text {
+                                        text: result.modified;
+                                        font-size: 11px;
+                                        color: #888;
+                                    }
+                                }
+                            }
+
+                            // Click to open
+                            TouchArea {
+                                clicked => {
+                                    result_selected(result.path);
+                                }
+                            }
+                        }
+                    }
+
+                    // Loading state
+                    Text {
+                        visible: searching && results_count == 0;
+                        text: "Searching...";
+                        font-size: 14px;
+                        color: #888;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+
+                    // No results state
+                    Text {
+                        visible: !searching && search_text != "" && results_count == 0;
+                        text: "No results found";
+                        font-size: 14px;
+                        color: #888;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+
+                    // Results count
+                    Text {
+                        visible: !searching && results_count > 0;
+                        text: "Results: {results_count}";
+                        font-size: 14px;
+                        color: #666;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+
+            // Preview pane
+            Rectangle {
+                visible: show_preview && preview_text != "";
+                background: #f5f5f5;
+                border-width: 1px;
+                border-color: border_color;
+                border-radius: 4px;
+                height: 120px;
+                clip: true;
+                padding: 8px;
+
+                VerticalLayout {
+                    spacing: 4px;
+                    Text {
+                        text: "Preview: {preview_path}";
+                        font-size: 12px;
+                        color: #666;
+                        font-weight: 600;
+                    }
+                    Text {
+                        text: preview_text;
+                        font-size: 13px;
+                        color: text_color;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+
+            // Status bar
+            HorizontalLayout {
+                spacing: 12px;
+                Text {
+                    text: status_text;
+                    font-size: 12px;
+                    color: #888;
+                }
+                Text {
+                    text: "{hotkey_hint} to open | Esc to close";
+                    font-size: 11px;
+                    color: #aaa;
+                }
+            }
+        }
+    }
+}

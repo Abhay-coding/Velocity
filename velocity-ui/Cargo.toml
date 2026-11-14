@@ -1,0 +1,18 @@
+[package]
+name = "velocity-ui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+velocity-core = { path = "../velocity-core" }
+velocity-everything = { path = "../velocity-everything" }
+slint = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }
+rdev = "0.5"
+
+[build-dependencies]
+slint-build = { workspace = true }
