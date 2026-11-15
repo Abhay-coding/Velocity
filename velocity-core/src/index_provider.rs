@@ -1,4 +1,4 @@
-use crate::{VelocityError, VelocityResult};
+use crate::VelocityResult;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 

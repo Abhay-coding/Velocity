@@ -112,6 +112,26 @@ key = "Alt+Space"
 
 ## Development
 
+### Testing the MFT Parser
+
+The `velocity-mft` crate includes a test example that validates the parser against a real NTFS volume (C: drive):
+
+```bash
+# Requires Administrator privileges to access raw volume
+# Open PowerShell as Administrator first, then:
+cd velocity
+cargo run -p velocity-mft --example test_mft
+```
+
+This test:
+1. Opens `\\.\C:` for raw MFT access (read-only)
+2. Parses and displays boot sector info (bytes/sector, sectors/cluster, MFT location)
+3. Reads and displays MFT records
+4. Tests path building from parent references
+5. Initializes the full IndexProvider and performs sample searches
+
+**Note**: The full drive indexing in step 5 scans the entire MFT and can take 10+ minutes on large drives. Press Ctrl+C to stop after verifying the core parser works (steps 1-4 complete in seconds).
+
 ### Project Structure
 
 ```

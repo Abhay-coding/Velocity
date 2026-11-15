@@ -16,6 +16,8 @@ windows = { version = "0.58", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_SystemServices",
     "Win32_System_ProcessStatus",
+    "Win32_Storage",
+    "Win32_System_IO",
 ] }
 tokio = { version = "1.38", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -26,3 +28,4 @@ thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 async-trait = "0.1"
+byteorder = "1.5"

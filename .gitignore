@@ -53,3 +53,16 @@ rust-analyzer/
 # Backup files
 *.bak
 *.backup
+
+# MFT test output (run with admin privileges)
+velocity/target/debug/examples/test_mft.exe
+velocity/target/release/examples/test_mft.exe
+
+# Admin/sudo required files (Windows)
+*.manifest
+
+# Windows reserved names and accidental files
+nul
+u64
+self
+*provider*capabilities*
