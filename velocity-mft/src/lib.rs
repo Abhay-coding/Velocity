@@ -18,6 +18,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use globset::{Glob, GlobSet, GlobSetBuilder};
 
 /// NTFS MFT Parser - Production implementation
 ///
@@ -268,7 +269,27 @@ impl MftParser {
             path.push(component);
         }
 
-        Ok(path)
+        // Prepend drive letter from volume_path (e.g., "\\.\C:" -> "C:")
+        let drive_letter = Self::extract_drive_letter(&self.volume_path);
+        if let Some(drive) = drive_letter {
+            let mut full_path = PathBuf::from(format!("{}:\\", drive));
+            full_path.push(path);
+            Ok(full_path)
+        } else {
+            Ok(path)
+        }
+    }
+
+    /// Extract drive letter from volume path (e.g., "\\.\C:" -> Some('C'))
+    fn extract_drive_letter(volume_path: &PathBuf) -> Option<char> {
+        let path_str = volume_path.to_string_lossy();
+        // Handle formats: "\\.\C:", "C:", etc.
+        for ch in path_str.chars() {
+            if ch.is_ascii_alphabetic() {
+                return Some(ch.to_ascii_uppercase());
+            }
+        }
+        None
     }
 
     /// Close the volume handle
@@ -313,15 +334,36 @@ pub struct MftProvider {
     indexed_files: Arc<RwLock<Vec<MftFileEntry>>>,
     is_indexing: Arc<RwLock<bool>>,
     last_stats: Arc<RwLock<Option<IndexStats>>>,
+    exclude_globset: Option<Arc<GlobSet>>,
 }
 
 impl MftProvider {
     pub fn new(volume_path: PathBuf) -> Self {
+        Self::with_excludes(volume_path, vec![])
+    }
+
+    pub fn with_excludes(volume_path: PathBuf, exclude_patterns: Vec<String>) -> Self {
+        let exclude_globset = if exclude_patterns.is_empty() {
+            None
+        } else {
+            let mut builder = GlobSetBuilder::new();
+            for pattern in exclude_patterns {
+                if let Ok(glob) = Glob::new(&pattern) {
+                    builder.add(glob);
+                }
+            }
+            match builder.build() {
+                Ok(globset) => Some(Arc::new(globset)),
+                Err(_) => None,
+            }
+        };
+
         Self {
             parser: Arc::new(RwLock::new(MftParser::new(volume_path))),
             indexed_files: Arc::new(RwLock::new(Vec::new())),
             is_indexing: Arc::new(RwLock::new(false)),
             last_stats: Arc::new(RwLock::new(None)),
+            exclude_globset,
         }
     }
 
@@ -334,10 +376,13 @@ impl MftProvider {
 #[async_trait]
 impl IndexProvider for MftProvider {
     async fn initialize(&self) -> VelocityResult<()> {
-        let mut parser = self.parser.write().await;
-        parser.open().await?;
+        // Open the parser first (acquire lock briefly)
+        {
+            let mut parser = self.parser.write().await;
+            parser.open().await?;
+        }
 
-        // Perform initial indexing
+        // Perform initial indexing (reindex acquires its own lock)
         self.reindex().await?;
 
         Ok(())
@@ -414,15 +459,44 @@ impl IndexProvider for MftProvider {
         let mut parser = self.parser.write().await;
         let entries = parser.enumerate_files().await?;
 
-        // Build full paths for entries
+        // Build full paths for entries and filter by exclude patterns
         let mut entries_with_paths = Vec::new();
         for entry in entries {
-            // For now, just use name as path (will be improved)
-            let path = if entry.path.as_os_str().is_empty() {
-                PathBuf::from(&entry.name)
-            } else {
-                entry.path.clone()
+            // Build full path using the parser (includes drive letter)
+            // Need to convert MftFileEntry to MftRecord for build_path
+            let record = match parser.read_record(entry.file_reference >> 16).await {
+                Ok(r) => r,
+                Err(_) => {
+                    // Fallback to name if record reading fails
+                    let path = PathBuf::from(&entry.name);
+                    // Filter by exclude patterns if configured
+                    if let Some(ref globset) = self.exclude_globset {
+                        let path_str = path.to_string_lossy();
+                        if globset.is_match(path_str.as_ref()) {
+                            continue; // Skip excluded paths
+                        }
+                    }
+                    entries_with_paths.push(MftFileEntry {
+                        path,
+                        ..entry
+                    });
+                    continue;
+                }
             };
+
+            let path = match parser.build_path(&record).await {
+                Ok(p) => p,
+                Err(_) => PathBuf::from(&entry.name),
+            };
+
+            // Filter by exclude patterns if configured
+            if let Some(ref globset) = self.exclude_globset {
+                let path_str = path.to_string_lossy();
+                if globset.is_match(path_str.as_ref()) {
+                    continue; // Skip excluded paths
+                }
+            }
+
             entries_with_paths.push(MftFileEntry {
                 path,
                 ..entry

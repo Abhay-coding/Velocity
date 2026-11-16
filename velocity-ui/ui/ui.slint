@@ -22,13 +22,23 @@ export component SearchBar inherits Window {
     in property <bool> searching: false;
     in property <string> status_text: "";
 
+    // Selection state for keyboard navigation
+    in-out property <string> selected_path: "";
+
     // Search results model - populated from Rust
     in property <[SearchResultItem]> search_results: [];
 
     callback search_requested(string);
     callback result_selected(string);
+    callback result_opened(string);
+    callback result_opened_folder(string);
     callback hotkey_pressed();
     callback escape_pressed();
+    callback selection_changed(string);
+    callback key_up_pressed();
+    callback key_down_pressed();
+    callback key_enter_pressed();
+    callback key_ctrl_enter_pressed();
 
     preferred-width: 640px;
     preferred-height: 480px;
@@ -93,77 +103,84 @@ export component SearchBar inherits Window {
                 border-width: 2px;
                 border-color: border_color;
                 border-radius: 4px;
-                clip: false;
+                clip: true;
 
-                VerticalLayout {
+                Flickable {
                     width: parent.width;
                     height: parent.height;
-                    spacing: 0;
-                    padding: 0;
+                    content-height: search_results.length * 50px;
 
-                    // Results from Rust model - rendered via for loop
-                    for item in search_results : Rectangle {
+                    VerticalLayout {
                         width: parent.width;
-                        height: 50px;
-                        background: #f8f9fa;
-                        border-width: 1px;
-                        border-color: #e8e8e8;
+                        spacing: 0;
+                        padding: 0;
 
-                        HorizontalLayout {
+                        // Results from Rust model - rendered via for loop
+                        for item in search_results : Rectangle {
                             width: parent.width;
-                            height: parent.height;
-                            spacing: 12px;
-                            padding-left: 12px;
-                            padding-right: 12px;
-                            padding-top: 8px;
-                            padding-bottom: 8px;
+                            height: 50px;
+                            background: item.path == selected_path ? #e3f2fd : #f8f9fa;
+                            border-width: 1px;
+                            border-color: item.path == selected_path ? accent_color : #e8e8e8;
 
-                            // File type icon
-                            Rectangle {
-                                width: 32px;
-                                height: 32px;
-                                background: item.is_directory ? accent_color : #6c757d;
-                                border-radius: 4px;
-                                Text {
-                                    text: item.is_directory ? "📁" : "📄";
-                                    font-size: 16px;
-                                    color: #ffffff;
-                                    horizontal-alignment: center;
-                                    vertical-alignment: center;
-                                }
-                            }
-
-                            // File info
-                            VerticalLayout {
-                                width: parent.width - 56px;
-                                spacing: 2px;
-                                Text {
-                                    text: item.name;
-                                    font-size: 14px;
-                                    color: text_color;
-                                    font-weight: 500;
-                                }
-                                HorizontalLayout {
-                                    spacing: 16px;
-                                    Text {
-                                        text: item.size;
-                                        font-size: 12px;
-                                        color: #888;
-                                    }
-                                    Text {
-                                        text: item.modified;
-                                        font-size: 12px;
-                                        color: #888;
-                                    }
-                                }
-                            }
-
-                            // Click area
-                            TouchArea {
+                            HorizontalLayout {
                                 width: parent.width;
                                 height: parent.height;
-                                clicked => {
-                                    root.result_selected(item.path);
+                                spacing: 12px;
+                                padding-left: 12px;
+                                padding-right: 12px;
+                                padding-top: 8px;
+                                padding-bottom: 8px;
+
+                                // File type icon
+                                Rectangle {
+                                    width: 32px;
+                                    height: 32px;
+                                    background: item.is_directory ? accent_color : #6c757d;
+                                    border-radius: 4px;
+                                    Text {
+                                        text: item.is_directory ? "📁" : "📄";
+                                        font-size: 16px;
+                                        color: #ffffff;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+
+                                // File info
+                                VerticalLayout {
+                                    width: parent.width - 56px;
+                                    spacing: 2px;
+                                    Text {
+                                        text: item.name;
+                                        font-size: 14px;
+                                        color: item.path == selected_path ? accent_color : text_color;
+                                        font-weight: 500;
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 16px;
+                                        Text {
+                                            text: item.size;
+                                            font-size: 12px;
+                                            color: #888;
+                                        }
+                                        Text {
+                                            text: item.modified;
+                                            font-size: 12px;
+                                            color: #888;
+                                        }
+                                    }
+                                }
+
+                                // Click area
+                                TouchArea {
+                                    width: parent.width;
+                                    height: parent.height;
+                                    clicked => {
+                                        root.result_selected(item.path);
+                                        selected_path = item.path;
+                                        selection_changed(item.path);
+                                    }
                                 }
                             }
                         }
@@ -181,7 +198,7 @@ export component SearchBar inherits Window {
             HorizontalLayout {
                 spacing: 12px;
                 Text { text: status_text; font-size: 12px; color: #888; }
-                Text { text: "Alt+Space to open | Esc to close"; font-size: 11px; color: #aaa; }
+                Text { text: "Alt+Space to open | ↑↓ navigate | Enter open | Ctrl+Enter open folder | Esc to close"; font-size: 11px; color: #aaa; }
             }
         }
     }

@@ -3,12 +3,12 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use tokio::process::Command;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use velocity_core::{
     error::{VelocityError, VelocityResult},
     index_provider::{
-        IndexProvider, IndexStats, IndexingProgress, ProviderCapabilities, SearchQuery,
+        IndexProvider, IndexStats, ProviderCapabilities, SearchQuery,
         SearchResult, SearchResults,
     },
 };
@@ -25,7 +25,6 @@ impl EverythingCliAdapter {
             // Default locations to search for es.exe
             let candidates = vec![
                 PathBuf::from("es.exe"),
-                PathBuf::from(r"D:\Everything\es.exe"),
                 PathBuf::from(r"C:\Program Files\Everything\es.exe"),
                 PathBuf::from(r"C:\Program Files (x86)\Everything\es.exe"),
                 std::env::current_exe()
@@ -68,7 +67,7 @@ impl EverythingCliAdapter {
         args
     }
 
-    fn parse_output(&self, output: &str) -> VelocityResult<Vec<SearchResult>> {
+    async fn parse_output(&self, output: &str) -> VelocityResult<Vec<SearchResult>> {
         let mut results = Vec::new();
         for line in output.lines() {
             let line = line.trim();
@@ -82,11 +81,9 @@ impl EverythingCliAdapter {
                 .unwrap_or(line)
                 .to_string();
 
-            let is_directory = std::fs::metadata(&path)
-                .map(|m| m.is_dir())
-                .unwrap_or(false);
-
-            let metadata = std::fs::metadata(&path).ok();
+            // Use tokio::fs::metadata for non-blocking I/O
+            let metadata = tokio::fs::metadata(&path).await.ok();
+            let is_directory = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
             let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
             let modified = metadata
                 .and_then(|m| m.modified().ok())
@@ -188,7 +185,7 @@ impl IndexProvider for EverythingCliAdapter {
             )));
         }
 
-        let results = self.parse_output(&stdout)?;
+        let results = self.parse_output(&stdout).await?;
         let results_count = results.len();
 
         // For total_count, we need to get the actual total from Everything
@@ -216,26 +213,41 @@ impl IndexProvider for EverythingCliAdapter {
     }
 
     async fn stats(&self) -> VelocityResult<IndexStats> {
-        // Get total count by searching with empty query
-        // Use a reasonable max_results to avoid timeout
-        // If results.len() < max_results, we have the exact count
-        // If results.len() == max_results, there are at least that many
-        let max_results = 10000; // Reasonable limit to avoid timeout
-        let query = SearchQuery {
-            text: String::new(),
-            max_results,
-            offset: 0,
-        };
+        // Try to get actual total count using es.exe count flag
+        // First try: use -c flag for count (es.exe 1.1.0.18+)
+        let count_output = Command::new(&self.es_path)
+            .args(["-c", ""])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .ok()
+            .and_then(|output| {
+                if output.status.success() {
+                    String::from_utf8(output.stdout).ok()
+                } else {
+                    None
+                }
+            })
+            .and_then(|stdout| stdout.trim().parse::<u64>().ok());
 
-        let results = self.search(query).await?;
-        let total_count = results.total_count;
-
-        // If we got fewer than max_results, we have the exact count
-        // If we got exactly max_results, there are at least that many
-        let total_files = if total_count < max_results {
-            total_count as u64
+        let total_files = if let Some(count) = count_output {
+            count
         } else {
-            total_count as u64 // At least this many
+            // Fallback: use search with reasonable max_results
+            let max_results = 10000;
+            let query = SearchQuery {
+                text: String::new(),
+                max_results,
+                offset: 0,
+            };
+            let results = self.search(query).await?;
+            let total_count = results.total_count;
+            if total_count < max_results {
+                total_count as u64
+            } else {
+                total_count as u64 // At least this many
+            }
         };
 
         Ok(IndexStats {
