@@ -1,0 +1,33 @@
+[hotkey]
+key = "Alt+Shift"
+modifiers = ["Alt", "Shift"]
+
+[excludes]
+enabled = true
+patterns = [
+    "**/node_modules/**",
+    "**/.git/**",
+    "**/AppData/**",
+    "**/Windows/**",
+    "**/Program Files/**",
+    "**/Program Files (x86)/**",
+    "**/$Recycle.Bin/**",
+    "**/System Volume Information/**",
+]
+
+[drives]
+enabled = true
+drives = []
+
+[indexing]
+enabled = true
+interval_secs = 300
+show_progress = true
+partial_search_allowed = true
+
+[ui]
+theme = "system"
+max_results = 100
+preview_enabled = true
+preview_max_size_mb = 50
+hover_delay_ms = 300
