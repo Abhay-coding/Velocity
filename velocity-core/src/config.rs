@@ -29,20 +29,17 @@ impl HotkeyConfig {
             return Err(VelocityError::Config("Hotkey cannot be empty".to_string()));
         }
 
-        // Check that modifiers are not empty
-        if self.modifiers.is_empty() {
-            return Err(VelocityError::Config("Hotkey must have at least one modifier".to_string()));
+        // The stored list contains every component, including the final key.
+        let key_parts: Vec<&str> = self.key.split('+').map(str::trim).collect();
+        if key_parts.len() < 2 || key_parts.iter().any(|part| part.is_empty()) {
+            return Err(VelocityError::Config("Hotkey must include a modifier and a key".to_string()));
         }
-
-        // Validate that modifiers match the key string
-        let key_parts: Vec<&str> = self.key.split('+').map(|s| s.trim()).collect();
-        if key_parts.len() != self.modifiers.len() {
-            return Err(VelocityError::Config("Hotkey modifiers don't match key string".to_string()));
+        if key_parts.len() != self.modifiers.len()
+            || !key_parts.iter().zip(&self.modifiers).all(|(part, stored)| part.eq_ignore_ascii_case(stored.trim())) {
+            return Err(VelocityError::Config("Hotkey components don't match key string".to_string()));
         }
-
-        // Check for valid modifier keys
         let valid_modifiers = ["Alt", "Control", "Ctrl", "Shift", "Win", "Meta", "Super"];
-        for modifier in &self.modifiers {
+        for modifier in &key_parts[..key_parts.len() - 1] {
             if !valid_modifiers.iter().any(|v| v.eq_ignore_ascii_case(modifier)) {
                 return Err(VelocityError::Config(format!("Invalid modifier key: {}", modifier)));
             }
@@ -321,5 +318,20 @@ impl Config {
             .map_err(|e| VelocityError::Config(format!("Failed to serialize config: {}", e)))?;
         std::fs::write(&config_path, content)?;
         Ok(())
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_is_valid() {
+        Config::default().validate().expect("default config must be usable");
+    }
+
+    #[test]
+    fn rejects_inconsistent_hotkey_components() {
+        let hotkey = HotkeyConfig { key: "Alt+Space".into(), modifiers: vec!["Ctrl".into(), "Space".into()] };
+        assert!(hotkey.validate().is_err());
     }
 }

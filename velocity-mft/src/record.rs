@@ -877,8 +877,8 @@ mod tests {
         data[0..4].copy_from_slice(b"FILE");
         data[4..6].copy_from_slice(&48u16.to_le_bytes()); // usa_offset
         data[6..8].copy_from_slice(&2u16.to_le_bytes());  // usa_count
-        data[40..42].copy_from_slice(&48u16.to_le_bytes()); // first_attribute_offset
-        data[42..44].copy_from_slice(&1u16.to_le_bytes());  // flags (in_use)
+        data[20..22].copy_from_slice(&48u16.to_le_bytes()); // first_attribute_offset
+        data[22..24].copy_from_slice(&1u16.to_le_bytes());  // flags (in_use)
 
         let header = FileRecordHeader::parse(&data).expect("Failed to parse header");
         assert_eq!(&header.signature, b"FILE");

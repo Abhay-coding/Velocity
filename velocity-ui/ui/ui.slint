@@ -24,9 +24,11 @@ export component SearchBar inherits Window {
 
     // Selection state for keyboard navigation
     in-out property <string> selected_path: "";
+    property <int> selected_index: -1;
 
     // Search results model - populated from Rust
     in property <[SearchResultItem]> search_results: [];
+    changed search_results => { selected_index = -1; selected_path = ""; }
 
     callback search_requested(string);
     callback result_selected(string);
@@ -44,6 +46,7 @@ export component SearchBar inherits Window {
     preferred-height: 480px;
 
     background: bg_color;
+    init => { input.focus(); }
 
     Rectangle {
         x: 0;
@@ -79,11 +82,37 @@ export component SearchBar inherits Window {
                     border-width: 1px;
                     border-color: border_color;
                     border-radius: 4px;
-                    TextInput {
+                    input := TextInput {
                         x: 4px; y: 0; width: parent.width - 8px; height: 32px;
-                        text: search_text; font-size: 16px; color: text_color;
+                        text <=> search_text; font-size: 16px; color: text_color;
                         horizontal-alignment: left; vertical-alignment: center;
-                        edited => { search_requested(self.text); }
+                        edited => { selected_index = -1; search_requested(self.text); }
+                        key-pressed(event) => {
+                            if event.text == Key.Escape {
+                                escape_pressed();
+                                return accept;
+                            }
+                            if event.text == Key.DownArrow && search_results.length > 0 {
+                                selected_index = Math.min(selected_index + 1, search_results.length - 1);
+                                selected_path = search_results[selected_index].path;
+                                results_view.content-y = -Math.max(0px, selected_index * 50px - 250px);
+                                return accept;
+                            }
+                            if event.text == Key.UpArrow && search_results.length > 0 {
+                                selected_index = Math.max(selected_index - 1, 0);
+                                selected_path = search_results[selected_index].path;
+                                results_view.content-y = -Math.max(0px, selected_index * 50px - 250px);
+                                return accept;
+                            }
+                            if event.text == Key.Return && search_results.length > 0 {
+                                if selected_index < 0 { selected_index = 0; }
+                                selected_path = search_results[selected_index].path;
+                                if event.modifiers.control { result_opened_folder(selected_path); }
+                                else { result_opened(selected_path); }
+                                return accept;
+                            }
+                            return reject;
+                        }
                     }
                 }
                 TouchArea {
@@ -105,7 +134,7 @@ export component SearchBar inherits Window {
                 border-radius: 4px;
                 clip: true;
 
-                Flickable {
+                results_view := Flickable {
                     width: parent.width;
                     height: parent.height;
                     content-height: search_results.length * 50px;
@@ -116,7 +145,7 @@ export component SearchBar inherits Window {
                         padding: 0;
 
                         // Results from Rust model - rendered via for loop
-                        for item in search_results : Rectangle {
+                        for item[index] in search_results : Rectangle {
                             width: parent.width;
                             height: 50px;
                             background: item.path == selected_path ? #e3f2fd : #f8f9fa;
@@ -178,6 +207,7 @@ export component SearchBar inherits Window {
                                     height: parent.height;
                                     clicked => {
                                         root.result_selected(item.path);
+                                        selected_index = index;
                                         selected_path = item.path;
                                         selection_changed(item.path);
                                     }

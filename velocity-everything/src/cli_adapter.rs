@@ -55,15 +55,12 @@ impl EverythingCliAdapter {
     }
 
     fn build_search_args(&self, query: &SearchQuery) -> Vec<String> {
-        let mut args = vec![
-            "-n".to_string(),
-            query.max_results.to_string(),
-            "-s".to_string(), // sort by name
-            query.text.clone(),
-        ];
+        let mut args = vec!["-n".to_string(), query.max_results.to_string(), "-s".to_string()];
         if query.offset > 0 {
             args.extend(["-o".to_string(), query.offset.to_string()]);
         }
+        // Prevent search text beginning with '-' from being interpreted as a CLI switch.
+        args.extend(["--".to_string(), query.text.clone()]);
         args
     }
 
@@ -112,25 +109,19 @@ impl EverythingCliAdapter {
 #[async_trait::async_trait]
 impl IndexProvider for EverythingCliAdapter {
     async fn initialize(&self) -> VelocityResult<()> {
-        // Check if es.exe exists and is executable
-        if !self.es_path.exists() {
-            return Err(VelocityError::EverythingNotFound(format!(
-                "es.exe not found at: {}",
-                self.es_path.display()
-            )));
-        }
-
-        // Try a simple test search that should always work (search for nothing)
-        // Use -n 0 to limit results to 0, which should always succeed
-        let output = Command::new(&self.es_path)
-            .args(["-n", "0", ""])
-            .output()
-            .await
-            .map_err(|e| VelocityError::EverythingNotFound(format!(
-                "Failed to execute {}: {}",
-                self.es_path.display(),
-                e
-            )))?;
+        // Let process creation resolve bare executable names through PATH.
+        let output = tokio::time::timeout(self.timeout, async {
+            Command::new(&self.es_path)
+                .args(["-n", "0", "--", ""])
+                .kill_on_drop(true)
+                .output()
+                .await
+        })
+        .await
+        .map_err(|_| VelocityError::EverythingNotFound("Everything initialization timed out".to_string()))?
+        .map_err(|e| VelocityError::EverythingNotFound(format!(
+            "Failed to execute {}: {}", self.es_path.display(), e
+        )))?;
 
         // es.exe returns exit code 1 for help, but for searches it returns 0 on success
         if !output.status.success() {
@@ -162,6 +153,7 @@ impl IndexProvider for EverythingCliAdapter {
                 .args(&args)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
+                .kill_on_drop(true)
                 .output()
                 .await
         })
@@ -290,5 +282,32 @@ impl IndexProvider for EverythingCliAdapter {
 
     async fn shutdown(&self) -> VelocityResult<()> {
         Ok(())
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normal_query_follows_options_and_switch_terminator() {
+        let adapter = EverythingCliAdapter::new(None);
+        let query = SearchQuery { text: "report 2026".into(), max_results: 10, offset: 0 };
+        assert_eq!(adapter.build_search_args(&query),
+            ["-n", "10", "-s", "--", "report 2026"]);
+    }
+
+    #[test]
+    fn slash_prefixed_query_remains_one_search_argument() {
+        let adapter = EverythingCliAdapter::new(None);
+        let query = SearchQuery { text: "/?".into(), max_results: 10, offset: 0 };
+        assert_eq!(adapter.build_search_args(&query), ["-n", "10", "-s", "--", "/?"]);
+    }
+
+    #[test]
+    fn search_query_cannot_become_an_es_command_line_switch() {
+        let adapter = EverythingCliAdapter::new(None);
+        let query = SearchQuery { text: "-exit".into(), max_results: 25, offset: 10 };
+        assert_eq!(adapter.build_search_args(&query),
+            ["-n", "25", "-s", "-o", "10", "--", "-exit"]);
     }
 }

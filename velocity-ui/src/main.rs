@@ -28,6 +28,7 @@ enum UiCommand {
     ShowWindow,
     HideWindow,
     ResetSelection,
+    SearchFinished(u64, Result<(Vec<SearchResultItem>, String), String>),
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -52,20 +53,21 @@ fn format_timestamp(unix_secs: u64) -> String {
         .unwrap_or_default()
 }
 
-/// Safely open a file with the default application
-/// Properly escapes the path to prevent command injection
+/// Open a path with the Windows shell without interpreting it as a command line.
 fn open_file(path: &str) {
     #[cfg(target_os = "windows")]
     {
-        use std::process::Command;
-        // Use start with quoted path to safely handle spaces and special characters
-        // The empty string "" is the window title (required by start when quoting)
-        if let Err(e) = Command::new("cmd")
-            .args(["/c", "start", "", "\"", path, "\""])
-            .spawn()
-        {
-            error!("Failed to open file: {}", e);
+        use std::os::windows::ffi::OsStrExt;
+        use std::ffi::OsStr;
+        #[link(name = "shell32")]
+        extern "system" {
+            fn ShellExecuteW(hwnd: isize, operation: *const u16, file: *const u16,
+                parameters: *const u16, directory: *const u16, show: i32) -> isize;
         }
+        let wide: Vec<u16> = OsStr::new(path).encode_wide().chain(Some(0)).collect();
+        let result = unsafe { ShellExecuteW(0, std::ptr::null(), wide.as_ptr(),
+            std::ptr::null(), std::ptr::null(), 1) };
+        if result <= 32 { error!("Failed to open file (shell error {})", result); }
     }
 }
 
@@ -99,7 +101,7 @@ fn main() -> VelocityResult<()> {
         .with_env_filter("velocity=debug,info")
         .init();
 
-    info!("Starting Velocity Search (Dynamic Search Test)...");
+    info!("Starting Velocity Search...");
 
     // Create a tokio runtime in a separate thread for async operations
     // Use a oneshot channel to pass the runtime handle
@@ -131,47 +133,11 @@ fn main() -> VelocityResult<()> {
     let runtime_handle = runtime_rx.recv().expect("Failed to receive runtime handle");
     let runtime_handle_tray = runtime_handle.clone();
 
-    // Run async initialization on the tokio runtime
-    let (init_tx, init_rx) = std::sync::mpsc::channel();
-    runtime_handle.spawn(async move {
-        // Load configuration
-        let config = match Config::load() {
-            Ok(c) => {
-                info!("Configuration loaded");
-                c
-            }
-            Err(e) => {
-                error!("Failed to load config: {}", e);
-                let _ = init_tx.send(Err(e));
-                return;
-            }
-        };
-
-        // Initialize index provider (Everything CLI adapter)
-        let provider = EverythingCliAdapter::new(None)
-            .with_max_results(config.ui.max_results)
-            .with_timeout(Duration::from_secs(10));
-
-        let provider = Arc::new(provider);
-        let provider_initialized = match provider.initialize().await {
-            Ok(()) => {
-                info!("Index provider initialized");
-                if let Ok(stats) = provider.stats().await {
-                    info!("Index stats: {} files", stats.total_files);
-                }
-                true
-            }
-            Err(e) => {
-                error!("Failed to initialize index provider: {}", e);
-                false
-            }
-        };
-
-        let _ = init_tx.send(Ok((config, provider, provider_initialized)));
-    });
-
-    // Wait for initialization to complete
-    let (config, provider, _provider_initialized) = init_rx.recv().expect("Init channel closed")?;
+    let config = Config::load()?;
+    let max_results = config.ui.max_results;
+    let provider = Arc::new(EverythingCliAdapter::new(None)
+        .with_max_results(max_results)
+        .with_timeout(Duration::from_secs(10)));
 
     // Create Slint UI on the main thread
     let ui = SearchBar::new()?;
@@ -181,7 +147,7 @@ fn main() -> VelocityResult<()> {
     ui.set_hotkey_hint(config.hotkey.hotkey_hint().into());
     ui.set_searching(false);
     ui.set_results_count(0);
-    ui.set_status_text("Ready".into());
+    ui.set_status_text("Connecting to Everything...".into());
 
     // IMMEDIATELY SHOW WINDOW
     ui.show()?;
@@ -196,9 +162,11 @@ fn main() -> VelocityResult<()> {
     // Spawn UI command handler on the main thread (via event loop)
     let ui_handle = ui.as_weak();
     let ui_handle_for_commands = ui_handle.clone();
+    let command_search_id = search_id.clone();
     runtime_handle_tray.spawn(async move {
         while let Some(cmd) = ui_rx.recv().await {
             let ui_weak = ui_handle_for_commands.clone();
+            let command_search_id = command_search_id.clone();
             let _ = invoke_from_event_loop(move || {
                 if let Some(ui) = ui_weak.upgrade() {
                     match cmd {
@@ -220,6 +188,18 @@ fn main() -> VelocityResult<()> {
                             ui.set_status_text("".into());
                             ui.set_search_results(ModelRc::new(VecModel::from(Vec::<SearchResultItem>::new())));
                         }
+                        UiCommand::SearchFinished(id, outcome) => {
+                            if command_search_id.load(Ordering::SeqCst) != id { return; }
+                            ui.set_searching(false);
+                            match outcome {
+                                Ok((items, status)) => {
+                                    ui.set_results_count(items.len() as i32);
+                                    ui.set_search_results(ModelRc::new(VecModel::from(items)));
+                                    ui.set_status_text(status.into());
+                                }
+                                Err(message) => ui.set_status_text(format!("Error: {}", message).into()),
+                            }
+                        }
                         UiCommand::ResetSelection => {
                             ui.set_selected_path("".into());
                         }
@@ -233,6 +213,22 @@ fn main() -> VelocityResult<()> {
                 }
             });
         }
+    });
+
+    let init_provider = provider.clone();
+    let init_ui = ui.as_weak();
+    let init_search_id = search_id.clone();
+    runtime_handle.spawn(async move {
+        let result = init_provider.initialize().await;
+        let _ = invoke_from_event_loop(move || {
+            if init_search_id.load(Ordering::SeqCst) != 0 { return; }
+            if let Some(ui) = init_ui.upgrade() {
+                match result {
+                    Ok(()) => ui.set_status_text("Ready".into()),
+                    Err(e) => ui.set_status_text(format!("Everything unavailable: {}", e).into()),
+                }
+            }
+        });
     });
 
     // Set up global hotkey (Alt+Space) using rdev
@@ -286,7 +282,10 @@ fn main() -> VelocityResult<()> {
             return;
         }
 
-        if trimmed_query.len() < 2 {
+        if trimmed_query.chars().count() < 2 {
+            search_id.fetch_add(1, Ordering::SeqCst);
+            let _ = ui_tx.blocking_send(UiCommand::ClearResults);
+            let _ = ui_tx.blocking_send(UiCommand::ResetSelection);
             info!("Query too short (min 2 chars): '{}'", trimmed_query);
             let _ = ui_tx.blocking_send(UiCommand::SetStatus("Type at least 2 characters...".to_string()));
             return;
@@ -314,7 +313,7 @@ fn main() -> VelocityResult<()> {
 
             let search_query = SearchQuery {
                 text: trimmed_query,
-                max_results: 100,
+                max_results,
                 offset: 0,
             };
 
@@ -343,13 +342,12 @@ fn main() -> VelocityResult<()> {
                         is_directory: r.is_directory,
                     }).collect();
 
-                    let _ = ui_tx.send(UiCommand::SetResults(items)).await;
-                    let _ = ui_tx.send(UiCommand::SetStatus(format!("{} results in {}ms", results_count, query_time_ms))).await;
+                    let _ = ui_tx.send(UiCommand::SearchFinished(this_search_id,
+                        Ok((items, format!("{} results in {}ms", results_count, query_time_ms))))).await;
                 }
                 Err(e) => {
                     error!("Search #{} error: {}", this_search_id, e);
-                    let _ = ui_tx.send(UiCommand::SetSearching(false)).await;
-                    let _ = ui_tx.send(UiCommand::SetStatus(format!("Error: {}", e))).await;
+                    let _ = ui_tx.send(UiCommand::SearchFinished(this_search_id, Err(e.to_string()))).await;
                 }
             }
         });
@@ -456,33 +454,33 @@ fn main() -> VelocityResult<()> {
     tray_menu.append(&PredefinedMenuItem::separator()).map_err(|e| VelocityError::Config(format!("Failed to add separator: {}", e)))?;
 
     // "Pause Indexing" menu item
-    let pause_item = MenuItem::new("Pause Indexing", true, None);
+    let pause_item = MenuItem::new("Pause Indexing", false, None);
     tray_menu.append(&pause_item).map_err(|e| VelocityError::Config(format!("Failed to add menu item: {}", e)))?;
 
     // "Exclude List" menu item
-    let exclude_item = MenuItem::new("Exclude List...", true, None);
+    let exclude_item = MenuItem::new("Exclude List...", false, None);
     tray_menu.append(&exclude_item).map_err(|e| VelocityError::Config(format!("Failed to add menu item: {}", e)))?;
 
     // "Drives to Index" menu item
-    let drives_item = MenuItem::new("Drives to Index...", true, None);
+    let drives_item = MenuItem::new("Drives to Index...", false, None);
     tray_menu.append(&drives_item).map_err(|e| VelocityError::Config(format!("Failed to add menu item: {}", e)))?;
 
     // Separator
     tray_menu.append(&PredefinedMenuItem::separator()).map_err(|e| VelocityError::Config(format!("Failed to add separator: {}", e)))?;
 
     // "Auto-start" menu item (checkbox)
-    let autostart_item = MenuItem::new("Auto-start", true, None);
+    let autostart_item = MenuItem::new("Auto-start", false, None);
     tray_menu.append(&autostart_item).map_err(|e| VelocityError::Config(format!("Failed to add menu item: {}", e)))?;
 
     // Separator
     tray_menu.append(&PredefinedMenuItem::separator()).map_err(|e| VelocityError::Config(format!("Failed to add separator: {}", e)))?;
 
     // "Check for Updates" menu item
-    let updates_item = MenuItem::new("Check for Updates", true, None);
+    let updates_item = MenuItem::new("Check for Updates", false, None);
     tray_menu.append(&updates_item).map_err(|e| VelocityError::Config(format!("Failed to add menu item: {}", e)))?;
 
     // "About" menu item
-    let about_item = MenuItem::new("About", true, None);
+    let about_item = MenuItem::new("About", false, None);
     tray_menu.append(&about_item).map_err(|e| VelocityError::Config(format!("Failed to add menu item: {}", e)))?;
 
     // Separator
@@ -493,7 +491,12 @@ fn main() -> VelocityResult<()> {
     tray_menu.append(&quit_item).map_err(|e| VelocityError::Config(format!("Failed to add menu item: {}", e)))?;
 
     // Create tray icon
+    let mut pixels = vec![0u8; 32 * 32 * 4];
+    for pixel in pixels.chunks_exact_mut(4) { pixel.copy_from_slice(&[0, 120, 212, 255]); }
+    let icon = tray_icon::Icon::from_rgba(pixels, 32, 32)
+        .map_err(|e| VelocityError::Config(format!("Failed to create tray icon: {}", e)))?;
     let _tray_icon = TrayIconBuilder::new()
+        .with_icon(icon)
         .with_tooltip("Velocity Search")
         .with_menu(Box::new(tray_menu))
         .build()
@@ -504,7 +507,7 @@ fn main() -> VelocityResult<()> {
     let ui_tx_tray = ui_tx.clone();
 
     // Spawn task to handle tray events
-    runtime_handle_tray.spawn(async move {
+    std::thread::spawn(move || {
         loop {
             match tray_event_receiver.recv() {
                 Ok(event) => {
@@ -519,61 +522,18 @@ fn main() -> VelocityResult<()> {
         }
     });
 
-    // Set up menu event handler
+    // Menu events are received on a dedicated thread because recv is blocking.
     let menu_event_receiver = MenuEvent::receiver();
     let ui_tx_menu = ui_tx.clone();
-
-    runtime_handle_tray.spawn(async move {
-        loop {
-            match menu_event_receiver.recv() {
-                Ok(event) => {
-                    // Use the menu item ID which is the label text
-                    let id = event.id.0.to_string();
-                    match id.as_str() {
-                        "Show Search" => {
-                            let _ = ui_tx_menu.blocking_send(UiCommand::ShowWindow);
-                        }
-                        "Pause Indexing" => {
-                            info!("Pause Indexing clicked");
-                            let _ = ui_tx_menu.blocking_send(UiCommand::SetStatus("Indexing paused".to_string()));
-                        }
-                        "Exclude List..." => {
-                            info!("Exclude List clicked");
-                            #[cfg(target_os = "windows")]
-                            {
-                                use std::process::Command;
-                                let _ = Command::new("notepad")
-                                    .args(["excludes.txt"])
-                                    .spawn();
-                            }
-                        }
-                        "Drives to Index..." => {
-                            info!("Drives to Index clicked");
-                            #[cfg(target_os = "windows")]
-                            {
-                                use std::process::Command;
-                                let _ = Command::new("notepad")
-                                    .args(["drives.txt"])
-                                    .spawn();
-                            }
-                        }
-                        "Auto-start" => {
-                            info!("Auto-start clicked");
-                        }
-                        "Check for Updates" => {
-                            info!("Check for Updates clicked");
-                        }
-                        "About" => {
-                            info!("About clicked");
-                        }
-                        "Quit" => {
-                            info!("Quit clicked");
-                            std::process::exit(0);
-                        }
-                        _ => {}
-                    }
-                }
-                Err(_) => break,
+    let show_id = show_item.id().clone();
+    let quit_id = quit_item.id().clone();
+    std::thread::spawn(move || {
+        while let Ok(event) = menu_event_receiver.recv() {
+            if event.id == show_id {
+                let _ = ui_tx_menu.blocking_send(UiCommand::ShowWindow);
+            } else if event.id == quit_id {
+                let _ = invoke_from_event_loop(|| { let _ = slint::quit_event_loop(); });
+                break;
             }
         }
     });
