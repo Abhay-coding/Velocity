@@ -1,7 +1,7 @@
 //! velocity-mft: NTFS MFT Parser
 //!
-//! Production implementation of NTFS Master File Table (MFT) parsing for the Velocity search engine.
-//! This crate provides direct MFT access similar to Voidtools' Everything.
+//! Experimental NTFS Master File Table parser for learning and research.
+//! The scanner assumes a contiguous MFT and is not suitable for reliable indexing.
 
 pub mod boot_sector;
 pub mod record;
@@ -20,7 +20,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 
-/// NTFS MFT Parser - Production implementation
+/// Experimental NTFS MFT parser
 ///
 /// Provides direct access to NTFS Master File Table for fast file enumeration
 /// and searching. Uses Windows APIs for volume access.
@@ -225,39 +225,56 @@ impl MftParser {
 
         // Add the file's own name
         if let Some(name) = &current_record.file_name {
+            if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\']) {
+                return Err(VelocityError::Config("Invalid file name in MFT record".to_string()));
+            }
             path_components.push(name.clone());
         }
 
         // Walk up parent chain
         let mut parent_ref = current_record.parent_ref;
         let mut depth = 0;
+        let mut visited = std::collections::HashSet::new();
+        let mut reached_root = false;
         const MAX_DEPTH: u32 = 100;
 
         while let Some(parent) = parent_ref {
-            if depth >= MAX_DEPTH {
-                break;
+            if depth >= MAX_DEPTH || !visited.insert(parent) {
+                return Err(VelocityError::Config("Invalid parent chain".to_string()));
             }
 
-            // Extract record number from file reference (upper 48 bits)
-            let parent_record_number = parent >> 16;
+            // NTFS file references contain a low 48-bit record number and high 16-bit sequence.
+            let parent_record_number = parent & 0x0000_ffff_ffff_ffff;
 
             // Skip root directory (record 5) and system records
-            if parent_record_number <= 5 {
+            if parent_record_number == 5 {
+                reached_root = true;
                 break;
+            }
+            if parent_record_number < 5 {
+                return Err(VelocityError::Config("Invalid parent record".to_string()));
             }
 
             match self.read_record(parent_record_number).await {
                 Ok(parent_record) => {
-                    if let Some(name) = &parent_record.file_name {
-                        if !name.is_empty() && name != "." && name != ".." {
-                            path_components.push(name.clone());
-                        }
+                    if parent_record.header.sequence_number != (parent >> 48) as u16 {
+                        return Err(VelocityError::Config("Stale parent file reference".to_string()));
                     }
+                    let name = parent_record.file_name.as_ref()
+                        .filter(|n| !n.is_empty() && *n != "." && *n != ".." && !n.contains(['/', '\\']))
+                        .ok_or_else(|| VelocityError::Config("Invalid parent name".to_string()))?;
+                    if !parent_record.is_directory {
+                        return Err(VelocityError::Config("Parent is not a directory".to_string()));
+                    }
+                    path_components.push(name.clone());
                     parent_ref = parent_record.parent_ref;
                 }
-                Err(_) => break,
+                Err(e) => return Err(e),
             }
             depth += 1;
+        }
+        if !reached_root || path_components.is_empty() {
+            return Err(VelocityError::Config("Cannot resolve complete path".to_string()));
         }
 
         // Reverse to get correct order
@@ -276,20 +293,20 @@ impl MftParser {
             full_path.push(path);
             Ok(full_path)
         } else {
-            Ok(path)
+            Err(VelocityError::Config("Volume path does not contain a drive letter".to_string()))
         }
     }
 
     /// Extract drive letter from volume path (e.g., "\\.\C:" -> Some('C'))
     fn extract_drive_letter(volume_path: &PathBuf) -> Option<char> {
         let path_str = volume_path.to_string_lossy();
-        // Handle formats: "\\.\C:", "C:", etc.
-        for ch in path_str.chars() {
-            if ch.is_ascii_alphabetic() {
-                return Some(ch.to_ascii_uppercase());
-            }
+        let path = path_str.strip_prefix(r"\\.\").unwrap_or(&path_str);
+        let bytes = path.as_bytes();
+        if bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+            Some((bytes[0] as char).to_ascii_uppercase())
+        } else {
+            None
         }
-        None
     }
 
     /// Close the volume handle
@@ -328,7 +345,7 @@ pub struct MftFileEntry {
 
 /// MFT Provider implementing IndexProvider trait
 ///
-/// Production MFT-based index provider for the Velocity search engine.
+/// Experimental MFT-based provider; the scanner does not handle fragmented MFTs.
 pub struct MftProvider {
     parser: Arc<RwLock<MftParser>>,
     indexed_files: Arc<RwLock<Vec<MftFileEntry>>>,
@@ -456,57 +473,26 @@ impl IndexProvider for MftProvider {
     async fn reindex(&self) -> VelocityResult<()> {
         *self.is_indexing.write().await = true;
 
-        let mut parser = self.parser.write().await;
-        let entries = parser.enumerate_files().await?;
-
-        // Build full paths for entries and filter by exclude patterns
-        let mut entries_with_paths = Vec::new();
-        for entry in entries {
-            // Build full path using the parser (includes drive letter)
-            // Need to convert MftFileEntry to MftRecord for build_path
-            let record = match parser.read_record(entry.file_reference >> 16).await {
-                Ok(r) => r,
-                Err(_) => {
-                    // Fallback to name if record reading fails
-                    let path = PathBuf::from(&entry.name);
-                    // Filter by exclude patterns if configured
-                    if let Some(ref globset) = self.exclude_globset {
-                        let path_str = path.to_string_lossy();
-                        if globset.is_match(path_str.as_ref()) {
-                            continue; // Skip excluded paths
-                        }
-                    }
-                    entries_with_paths.push(MftFileEntry {
-                        path,
-                        ..entry
-                    });
+        let result = async {
+            let mut parser = self.parser.write().await;
+            let entries = parser.enumerate_files().await?;
+            let mut entries_with_paths = Vec::new();
+            for entry in entries {
+                let record = parser.read_record(entry.file_reference & 0x0000_ffff_ffff_ffff).await?;
+                if record.header.sequence_number != (entry.file_reference >> 48) as u16 {
+                    return Err(VelocityError::Config("Stale indexed file reference".to_string()));
+                }
+                let path = parser.build_path(&record).await?;
+                if self.exclude_globset.as_ref().is_some_and(|g| g.is_match(&path)) {
                     continue;
                 }
-            };
-
-            let path = match parser.build_path(&record).await {
-                Ok(p) => p,
-                Err(_) => PathBuf::from(&entry.name),
-            };
-
-            // Filter by exclude patterns if configured
-            if let Some(ref globset) = self.exclude_globset {
-                let path_str = path.to_string_lossy();
-                if globset.is_match(path_str.as_ref()) {
-                    continue; // Skip excluded paths
-                }
+                entries_with_paths.push(MftFileEntry { path, ..entry });
             }
-
-            entries_with_paths.push(MftFileEntry {
-                path,
-                ..entry
-            });
-        }
-
-        *self.indexed_files.write().await = entries_with_paths;
+            *self.indexed_files.write().await = entries_with_paths;
+            Ok(())
+        }.await;
         *self.is_indexing.write().await = false;
-
-        Ok(())
+        result
     }
 
     async fn pause_indexing(&self) -> VelocityResult<()> {

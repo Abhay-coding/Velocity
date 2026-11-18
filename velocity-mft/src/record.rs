@@ -142,7 +142,7 @@ impl FileRecordHeader {
 
     /// Get file reference number (combines record number and sequence number)
     pub fn file_reference(&self, record_number: u64) -> u64 {
-        (record_number << 16) | (self.sequence_number as u64)
+        (record_number & 0x0000_ffff_ffff_ffff) | ((self.sequence_number as u64) << 48)
     }
 }
 
@@ -225,11 +225,11 @@ impl ResidentAttributeHeader {
         if !common.is_resident() {
             return Err(VelocityError::Config("Not a resident attribute".to_string()));
         }
-        if data.len() < 32 {
+        if data.len() < 24 {
             return Err(VelocityError::Config("Resident attribute header too small".to_string()));
         }
 
-        let mut cursor = Cursor::new(&data[24..]);
+        let mut cursor = Cursor::new(&data[16..]);
         let value_length = cursor.read_u32::<LittleEndian>()?;
         let value_offset = cursor.read_u16::<LittleEndian>()?;
         let indexed_flag = cursor.read_u8()?;
@@ -246,7 +246,7 @@ impl ResidentAttributeHeader {
 
     /// Get the value data slice
     pub fn value<'a>(&self, data: &'a [u8]) -> VelocityResult<&'a [u8]> {
-        let start = self.common.name_offset as usize + self.value_offset as usize;
+        let start = self.value_offset as usize;
         let end = start + self.value_length as usize;
         if end > data.len() {
             return Err(VelocityError::Config("Value extends beyond attribute data".to_string()));
@@ -275,11 +275,11 @@ impl NonResidentAttributeHeader {
         if common.is_resident() {
             return Err(VelocityError::Config("Not a non-resident attribute".to_string()));
         }
-        if data.len() < 72 {
+        if data.len() < 64 {
             return Err(VelocityError::Config("Non-resident attribute header too small".to_string()));
         }
 
-        let mut cursor = Cursor::new(&data[24..]);
+        let mut cursor = Cursor::new(&data[16..]);
         let start_vcn = cursor.read_u64::<LittleEndian>()?;
         let last_vcn = cursor.read_u64::<LittleEndian>()?;
         let data_run_offset = cursor.read_u16::<LittleEndian>()?;
@@ -514,7 +514,11 @@ impl DataAttribute {
         attribute_id: u16,
         name: Option<String>,
     ) -> VelocityResult<Self> {
-        let runlist_data = &data[header.data_run_offset as usize..];
+        let runlist_offset = header.data_run_offset as usize;
+        if runlist_offset < 64 || runlist_offset >= data.len() {
+            return Err(VelocityError::Config("Runlist offset out of bounds".to_string()));
+        }
+        let runlist_data = &data[runlist_offset..];
         let runlist = parse_runlist(runlist_data, boot_sector)?;
 
         Ok(Self {
@@ -541,56 +545,43 @@ pub struct RunlistEntry {
 /// Parse NTFS runlist (variable-length encoding)
 pub fn parse_runlist(data: &[u8], _boot_sector: &BootSectorInfo) -> VelocityResult<Vec<RunlistEntry>> {
     let mut entries = Vec::new();
-    let mut offset = 0;
+    let mut offset = 0usize;
     let mut current_lcn: i64 = 0;
     let mut current_vcn: u64 = 0;
 
     while offset < data.len() {
         let header = data[offset];
-        if header == 0 {
-            break; // End of runlist
-        }
         offset += 1;
-
+        if header == 0 { return Ok(entries); }
         let length_bytes = (header & 0x0F) as usize;
         let offset_bytes = (header >> 4) as usize;
-
+        if !(1..=8).contains(&length_bytes) || offset_bytes > 8 {
+            return Err(VelocityError::Config("Invalid runlist field width".to_string()));
+        }
         if offset + length_bytes + offset_bytes > data.len() {
             return Err(VelocityError::Config("Runlist truncated".to_string()));
         }
-
-        // Read length (little-endian variable bytes)
-        let mut length: u64 = 0;
-        for i in 0..length_bytes {
-            length |= (data[offset + i] as u64) << (i * 8);
-        }
+        let mut length = 0u64;
+        for i in 0..length_bytes { length |= (data[offset + i] as u64) << (i * 8); }
         offset += length_bytes;
-
-        // Read offset (signed, little-endian variable bytes)
-        let mut lcn_offset: i64 = 0;
-        for i in 0..offset_bytes {
-            lcn_offset |= (data[offset + i] as i64) << (i * 8);
-        }
-        // Sign extend if needed
-        if offset_bytes > 0 {
-            let sign_bit = 1u64 << (offset_bytes * 8 - 1);
-            if (lcn_offset as u64) & sign_bit != 0 {
-                lcn_offset |= -1i64 << (offset_bytes * 8);
-            }
-        }
-        offset += offset_bytes;
-
-        current_lcn += lcn_offset;
-        let entry = RunlistEntry {
-            length,
-            lcn: current_lcn,
-            next_vcn: current_vcn + length,
+        if length == 0 { return Err(VelocityError::Config("Zero-length run".to_string())); }
+        let lcn = if offset_bytes == 0 {
+            -1 // Sparse runs do not change the previous physical LCN.
+        } else {
+            let mut bytes = [if data[offset + offset_bytes - 1] & 0x80 != 0 { 0xff } else { 0 }; 8];
+            bytes[..offset_bytes].copy_from_slice(&data[offset..offset + offset_bytes]);
+            let delta = i64::from_le_bytes(bytes);
+            current_lcn = current_lcn.checked_add(delta)
+                .ok_or_else(|| VelocityError::Config("Runlist LCN overflow".to_string()))?;
+            if current_lcn < 0 { return Err(VelocityError::Config("Negative runlist LCN".to_string())); }
+            current_lcn
         };
-        current_vcn = entry.next_vcn;
-        entries.push(entry);
+        offset += offset_bytes;
+        current_vcn = current_vcn.checked_add(length)
+            .ok_or_else(|| VelocityError::Config("Runlist VCN overflow".to_string()))?;
+        entries.push(RunlistEntry { length, lcn, next_vcn: current_vcn });
     }
-
-    Ok(entries)
+    Err(VelocityError::Config("Runlist missing terminator".to_string()))
 }
 
 /// Complete MFT record with all attributes
@@ -628,9 +619,14 @@ impl MftRecord {
         let mut attributes = Vec::new();
         let mut attr_offset = header.first_attribute_offset as usize;
 
-        while attr_offset < fixed_data.len() {
-            if attr_offset + 4 > fixed_data.len() {
-                break;
+        let used_size = header.used_size as usize;
+        if attr_offset < 48 || attr_offset > used_size {
+            return Err(VelocityError::Config("Invalid first attribute offset".to_string()));
+        }
+        let mut found_end = false;
+        while attr_offset < used_size {
+            if attr_offset + 4 > used_size {
+                return Err(VelocityError::Config("Truncated attribute end marker".to_string()));
             }
 
             // Check for end marker
@@ -642,12 +638,13 @@ impl MftRecord {
             ]);
 
             if type_id == 0xFFFFFFFF {
+                found_end = true;
                 break;
             }
 
             // Parse attribute header to get length
-            if attr_offset + 24 > fixed_data.len() {
-                break;
+            if attr_offset + 24 > used_size {
+                return Err(VelocityError::Config("Truncated attribute header".to_string()));
             }
             let length = u32::from_le_bytes([
                 fixed_data[attr_offset + 4],
@@ -656,8 +653,8 @@ impl MftRecord {
                 fixed_data[attr_offset + 7],
             ]) as usize;
 
-            if length == 0 || attr_offset + length > fixed_data.len() {
-                break;
+            if length < 24 || length > used_size - attr_offset {
+                return Err(VelocityError::Config("Invalid attribute length".to_string()));
             }
 
             let attr_data = &fixed_data[attr_offset..attr_offset + length];
@@ -668,6 +665,10 @@ impl MftRecord {
             attributes.push(attribute);
 
             attr_offset += length;
+        }
+
+        if !found_end {
+            return Err(VelocityError::Config("Missing attribute end marker".to_string()));
         }
 
         // Extract key information from attributes
@@ -734,49 +735,23 @@ impl MftRecord {
 
 /// Apply USA (Update Sequence Array) fixup to correct sector data
 fn apply_usa_fixup(data: &[u8], header: &FileRecordHeader) -> VelocityResult<Vec<u8>> {
-    if header.usa_offset == 0 || header.usa_count <= 1 {
-        return Ok(data.to_vec());
-    }
-
+    const STRIDE: usize = 512;
     let usa_offset = header.usa_offset as usize;
     let usa_count = header.usa_count as usize;
-    let sector_size = 512; // NTFS uses 512-byte sectors for USA
-
-    if usa_offset + usa_count * 2 > data.len() {
-        return Err(VelocityError::Config("USA offset out of bounds".to_string()));
+    if data.len() % STRIDE != 0 || usa_count != data.len() / STRIDE + 1
+        || usa_offset < 8 || usa_offset.checked_add(usa_count * 2).map_or(true, |end| end > data.len()) {
+        return Err(VelocityError::Config("Invalid update sequence array".to_string()));
     }
-
-    // Read the sequence number (first 2 bytes of USA)
-    let _sequence_number = u16::from_le_bytes([
-        data[usa_offset],
-        data[usa_offset + 1],
-    ]);
-
-    // Read the replacement values (remaining USA entries)
-    let mut replacements = Vec::new();
-    for i in 1..usa_count {
-        let idx = usa_offset + i * 2;
-        if idx + 1 >= data.len() {
-            break;
-        }
-        replacements.push(u16::from_le_bytes([data[idx], data[idx + 1]]));
-    }
-
-    // Apply fixup: replace last 2 bytes of each sector with replacement values
+    let sequence = [data[usa_offset], data[usa_offset + 1]];
     let mut fixed = data.to_vec();
-    for sector_idx in 0..usa_count - 1 {
-        let sector_end = (sector_idx + 1) * sector_size;
-        if sector_end >= fixed.len() {
-            break;
+    for sector in 0..usa_count - 1 {
+        let trailer = (sector + 1) * STRIDE - 2;
+        if data[trailer..trailer + 2] != sequence {
+            return Err(VelocityError::Config("Update sequence mismatch".to_string()));
         }
-        let replace_idx = sector_end - 2;
-        if sector_idx < replacements.len() {
-            let replacement = replacements[sector_idx];
-            fixed[replace_idx] = (replacement & 0xFF) as u8;
-            fixed[replace_idx + 1] = (replacement >> 8) as u8;
-        }
+        let replacement = usa_offset + (sector + 1) * 2;
+        fixed[trailer..trailer + 2].copy_from_slice(&data[replacement..replacement + 2]);
     }
-
     Ok(fixed)
 }
 
@@ -870,6 +845,106 @@ pub fn filetime_to_unix(filetime: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn geometry() -> BootSectorInfo {
+        BootSectorInfo { bytes_per_sector: 512, sectors_per_cluster: 8, bytes_per_cluster: 4096,
+            total_sectors: 100000, mft_lcn: 4, mft_mirror_lcn: 50, bytes_per_record: 1024,
+            bytes_per_index_record: 4096, volume_serial: 0, oem_id: "NTFS".into() }
+    }
+
+    fn protected_record() -> Vec<u8> {
+        let mut data = vec![0u8; 1024];
+        data[0..4].copy_from_slice(b"FILE");
+        data[4..6].copy_from_slice(&48u16.to_le_bytes());
+        data[6..8].copy_from_slice(&3u16.to_le_bytes());
+        data[16..18].copy_from_slice(&9u16.to_le_bytes());
+        data[20..22].copy_from_slice(&64u16.to_le_bytes());
+        data[22..24].copy_from_slice(&1u16.to_le_bytes());
+        data[24..28].copy_from_slice(&100u32.to_le_bytes());
+        data[28..32].copy_from_slice(&1024u32.to_le_bytes());
+        data[48..54].copy_from_slice(&[0xaa, 0xbb, 0x12, 0x34, 0x56, 0x78]);
+        data[510..512].copy_from_slice(&[0xaa, 0xbb]);
+        data[1022..1024].copy_from_slice(&[0xaa, 0xbb]);
+        // A correctly positioned resident $DATA attribute.
+        data[64..68].copy_from_slice(&0x80u32.to_le_bytes());
+        data[68..72].copy_from_slice(&32u32.to_le_bytes());
+        data[80..84].copy_from_slice(&4u32.to_le_bytes());
+        data[84..86].copy_from_slice(&24u16.to_le_bytes());
+        data[88..92].copy_from_slice(b"test");
+        data[96..100].copy_from_slice(&0xffffffffu32.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn file_reference_uses_low_48_bits_and_high_sequence() {
+        let data = protected_record();
+        let header = FileRecordHeader::parse(&data).unwrap();
+        assert_eq!(header.file_reference(0x1234_5678_9abc), 0x0009_1234_5678_9abc);
+    }
+
+    #[test]
+    fn fixup_restores_both_sector_trailers_and_parses_resident_data() {
+        let data = protected_record();
+        let header = FileRecordHeader::parse(&data).unwrap();
+        let fixed = apply_usa_fixup(&data, &header).unwrap();
+        assert_eq!(&fixed[510..512], &[0x12, 0x34]);
+        assert_eq!(&fixed[1022..1024], &[0x56, 0x78]);
+        let parsed = MftRecord::parse(&data, 42, &geometry()).unwrap();
+        match &parsed.attributes[0] { MftAttribute::Data(d) => assert_eq!(d.data, b"test"), _ => panic!("expected data") }
+    }
+
+    #[test]
+    fn fixup_rejects_torn_sector_and_invalid_count() {
+        let mut data = protected_record();
+        data[1022] = 0;
+        assert!(MftRecord::parse(&data, 42, &geometry()).is_err());
+        let mut data = protected_record();
+        data[6..8].copy_from_slice(&2u16.to_le_bytes());
+        assert!(MftRecord::parse(&data, 42, &geometry()).is_err());
+    }
+
+    #[test]
+    fn rejects_bad_attributes_and_missing_end_marker() {
+        let mut data = protected_record();
+        data[68..72].copy_from_slice(&0u32.to_le_bytes());
+        assert!(MftRecord::parse(&data, 42, &geometry()).is_err());
+        let mut data = protected_record();
+        data[96..100].fill(0);
+        assert!(MftRecord::parse(&data, 42, &geometry()).is_err());
+        let mut data = protected_record();
+        data[24..28].copy_from_slice(&90u32.to_le_bytes());
+        assert!(MftRecord::parse(&data, 42, &geometry()).is_err());
+    }
+
+    #[test]
+    fn sparse_runs_preserve_previous_lcn_for_relative_offsets() {
+        let runs = parse_runlist(&[0x11, 2, 100, 0x01, 3, 0x11, 1, 0xfe, 0], &geometry()).unwrap();
+        assert_eq!(runs.iter().map(|r| r.lcn).collect::<Vec<_>>(), [100, -1, 98]);
+        assert_eq!(runs[2].next_vcn, 6);
+    }
+
+    #[test]
+    fn rejects_malformed_and_overflowing_runlists() {
+        for data in [&[0x19, 1, 2, 3, 4, 5, 6, 7, 8, 9, 1, 0][..],
+            &[0x11, 1][..], &[0x11, 0, 1, 0][..], &[0x11, 1, 0xff, 0][..],
+            &[0x11, 1, 1][..]] {
+            assert!(parse_runlist(data, &geometry()).is_err(), "accepted {:?}", data);
+        }
+        // Eight-byte signed offset must not overflow during sign extension.
+        let runs = parse_runlist(&[0x81, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0], &geometry()).unwrap();
+        assert_eq!(runs[0].lcn, 1);
+    }
+
+    #[test]
+    fn rejects_nonresident_runlist_outside_attribute() {
+        let mut data = vec![0u8; 64];
+        data[0..4].copy_from_slice(&0x80u32.to_le_bytes());
+        data[4..8].copy_from_slice(&64u32.to_le_bytes());
+        data[8] = 1;
+        data[32..34].copy_from_slice(&1024u16.to_le_bytes());
+        let header = NonResidentAttributeHeader::parse(&data).unwrap();
+        assert!(DataAttribute::parse_non_resident(&header, &data, &geometry(), 0, None).is_err());
+    }
 
     #[test]
     fn test_filerecord_header_parse() {

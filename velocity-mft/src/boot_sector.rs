@@ -104,6 +104,21 @@ impl NtfsBootSector {
         let volume_serial = cursor.read_u64::<LittleEndian>()?;
         let checksum = cursor.read_u32::<LittleEndian>()?;
 
+        let cluster_bytes = u32::from(bytes_per_sector) * u32::from(sectors_per_cluster);
+        let record_bytes = if clusters_per_record > 0 {
+            u32::from(clusters_per_record as u8).checked_mul(cluster_bytes)
+        } else {
+            1u32.checked_shl((-(clusters_per_record as i16)) as u32)
+        };
+        if !matches!(bytes_per_sector, 512 | 1024 | 2048 | 4096)
+            || !sectors_per_cluster.is_power_of_two()
+            || sectors_per_cluster > 128
+            || clusters_per_record == 0 || clusters_per_record < -31
+            || clusters_per_index == 0 || clusters_per_index < -31
+            || !matches!(record_bytes, Some(512..=1_048_576)) {
+            return Err(VelocityError::Config("Invalid NTFS volume geometry".to_string()));
+        }
+
         Ok(Self {
             jump,
             oem_id,
@@ -142,14 +157,14 @@ impl NtfsBootSector {
             self.clusters_per_record as u32 * bytes_per_cluster
         } else {
             // Negative value means 2^abs(clusters_per_record)
-            1u32 << (-self.clusters_per_record as u32)
+            1u32.checked_shl((-(self.clusters_per_record as i16)) as u32).unwrap_or(0)
         };
 
         // Calculate bytes per index record
         let bytes_per_index_record = if self.clusters_per_index > 0 {
             self.clusters_per_index as u32 * bytes_per_cluster
         } else {
-            1u32 << (-self.clusters_per_index as u32)
+            1u32.checked_shl((-(self.clusters_per_index as i16)) as u32).unwrap_or(0)
         };
 
         // Convert OEM ID to string
@@ -179,7 +194,7 @@ impl NtfsBootSector {
         if self.clusters_per_record > 0 {
             self.clusters_per_record as u32 * self.bytes_per_cluster()
         } else {
-            1u32 << (-self.clusters_per_record as u32)
+            1u32.checked_shl((-(self.clusters_per_record as i16)) as u32).unwrap_or(0)
         }
     }
 }
@@ -256,6 +271,20 @@ mod tests {
         assert_eq!(info.bytes_per_index_record, 4096); // 1 * 4096
         assert_eq!(info.volume_serial, 0x123456789ABCDEFF);
         assert_eq!(info.oem_id, "NTFS");
+    }
+
+    #[test]
+    fn test_rejects_invalid_geometry_without_panicking() {
+        let mut data = vec![0u8; 512];
+        data[3..11].copy_from_slice(b"NTFS    ");
+        data[11..13].copy_from_slice(&512u16.to_le_bytes());
+        data[13] = 8;
+        data[64] = 0x80; // i8::MIN cannot represent a valid record size
+        data[68] = 1;
+        assert!(NtfsBootSector::parse(&data).is_err());
+        data[64] = 0xf6;
+        data[13] = 0;
+        assert!(NtfsBootSector::parse(&data).is_err());
     }
 
     #[test]
