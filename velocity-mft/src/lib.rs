@@ -417,7 +417,7 @@ impl IndexProvider for MftProvider {
 
         Ok(SearchResults {
             results,
-            total_count,
+            total_count: Some(total_count),
             query_time_ms: start.elapsed().as_millis() as u64,
             partial: total_count > query.max_results,
         })

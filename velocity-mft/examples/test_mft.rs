@@ -122,7 +122,7 @@ async fn test_mft_provider() -> VelocityResult<()> {
             };
 
             let results = provider.search(query).await?;
-            println!("  Found {} results (showing up to 10):", results.total_count);
+            println!("  Found {:?} results (showing up to 10):", results.total_count);
             for result in &results.results {
                 println!("    {} ({})", result.name, result.path.display());
             }
@@ -136,7 +136,7 @@ async fn test_mft_provider() -> VelocityResult<()> {
             };
 
             let results = provider.search(query).await?;
-            println!("  Found {} results (showing up to 10):", results.total_count);
+            println!("  Found {:?} results (showing up to 10):", results.total_count);
             for result in &results.results {
                 println!("    {} ({})", result.name, result.path.display());
             }
@@ -150,7 +150,7 @@ async fn test_mft_provider() -> VelocityResult<()> {
             };
 
             let results = provider.search(query).await?;
-            println!("  Found {} results (showing up to 10):", results.total_count);
+            println!("  Found {:?} results (showing up to 10):", results.total_count);
             for result in &results.results {
                 println!("    {} ({})", result.name, result.path.display());
             }

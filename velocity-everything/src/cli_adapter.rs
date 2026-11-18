@@ -3,7 +3,7 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use tokio::process::Command;
-use tracing::{debug, info, warn};
+use tracing::info;
 
 use velocity_core::{
     error::{VelocityError, VelocityResult},
@@ -55,19 +55,36 @@ impl EverythingCliAdapter {
     }
 
     fn build_search_args(&self, query: &SearchQuery) -> Vec<String> {
-        let mut args = vec!["-n".to_string(), query.max_results.to_string(), "-s".to_string()];
+        let mut args = vec!["-n".to_string(), query.offset.saturating_add(query.max_results).to_string(), "-s".to_string()];
         if query.offset > 0 {
-            args.extend(["-o".to_string(), query.offset.to_string()]);
+            args.extend(["-viewport-offset".to_string(), query.offset.to_string()]);
         }
         // Prevent search text beginning with '-' from being interpreted as a CLI switch.
         args.extend(["--".to_string(), query.text.clone()]);
         args
     }
 
+    async fn count(&self, text: &str) -> VelocityResult<usize> {
+        let output = tokio::time::timeout(self.timeout, Command::new(&self.es_path)
+            .args(["-get-result-count", "-no-digit-grouping", "--", text])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .output())
+            .await
+            .map_err(|_| VelocityError::IndexProvider("Everything count timed out".into()))?
+            .map_err(|e| VelocityError::IndexProvider(format!("Failed to run Everything count: {}", e)))?;
+        if !output.status.success() {
+            return Err(VelocityError::IndexProvider(format!("Everything count failed: {}", String::from_utf8_lossy(&output.stderr))));
+        }
+        let output = std::str::from_utf8(&output.stdout)
+            .map_err(|e| VelocityError::IndexProvider(format!("Invalid Everything count encoding: {}", e)))?;
+        output.trim().parse().map_err(|e| VelocityError::IndexProvider(format!("Invalid Everything count: {}", e)))
+    }
+
     async fn parse_output(&self, output: &str) -> VelocityResult<Vec<SearchResult>> {
         let mut results = Vec::new();
         for line in output.lines() {
-            let line = line.trim();
             if line.is_empty() {
                 continue;
             }
@@ -112,7 +129,7 @@ impl IndexProvider for EverythingCliAdapter {
         // Let process creation resolve bare executable names through PATH.
         let output = tokio::time::timeout(self.timeout, async {
             Command::new(&self.es_path)
-                .args(["-n", "0", "--", ""])
+                .args(["-n", "1", "--", ""])
                 .kill_on_drop(true)
                 .output()
                 .await
@@ -123,14 +140,8 @@ impl IndexProvider for EverythingCliAdapter {
             "Failed to execute {}: {}", self.es_path.display(), e
         )))?;
 
-        // es.exe returns exit code 1 for help, but for searches it returns 0 on success
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            // Check if it's just the help output (which returns 1 but is actually success)
-            if stderr.contains("Display this help") || stderr.contains("Search the database") {
-                info!("Everything CLI adapter initialized (help output detected)");
-                return Ok(());
-            }
             return Err(VelocityError::EverythingNotFound(format!(
                 "es.exe returned error: {}",
                 stderr
@@ -143,10 +154,13 @@ impl IndexProvider for EverythingCliAdapter {
 
     async fn search(&self, query: SearchQuery) -> VelocityResult<SearchResults> {
         let start = Instant::now();
+        if query.max_results == 0 {
+            let total_count = self.count(&query.text).await.ok();
+            return Ok(SearchResults { results: Vec::new(), total_count,
+                query_time_ms: start.elapsed().as_millis() as u64,
+                partial: total_count.map_or(true, |count| query.offset < count) });
+        }
         let args = self.build_search_args(&query);
-
-        info!("Executing es.exe with args: {:?}", args);
-        debug!("Executing es.exe with args: {:?}", args);
 
         let output = tokio::time::timeout(self.timeout, async {
             Command::new(&self.es_path)
@@ -165,32 +179,22 @@ impl IndexProvider for EverythingCliAdapter {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
 
-        info!("es.exe exit code: {}, stdout len: {}, stderr len: {}", exit_code, stdout.len(), stderr.len());
-        debug!("es.exe stdout: {}", stdout);
-        debug!("es.exe stderr: {}", stderr);
 
         if !output.status.success() {
-            warn!("es.exe search failed with exit code {}: {}", exit_code, stderr);
             return Err(VelocityError::IndexProvider(format!(
                 "Search failed (exit code {}): {}",
                 exit_code, stderr
             )));
         }
 
-        let results = self.parse_output(&stdout).await?;
+        let remaining = self.timeout.saturating_sub(start.elapsed());
+        let results = tokio::time::timeout(remaining, self.parse_output(&stdout)).await
+            .map_err(|_| VelocityError::IndexProvider("Search metadata timed out".into()))??;
         let results_count = results.len();
-
-        // For total_count, we need to get the actual total from Everything
-        // We can do a separate count query, or use the results length if it's less than max_results
-        // If results.len() < max_results, then total_count = results.len()
-        // Otherwise, we don't know the exact total without a separate count query
-        let total_count = if results_count < query.max_results {
-            results_count
-        } else {
-            // Results are capped at max_results, we can't know exact total without another query
-            // Return the count we got as a minimum
-            results_count
-        };
+        // Counting is optional: older ES versions may not support the count switch.
+        // Do not delay or fail a successful search if it is unavailable.
+        let count_budget = self.timeout.saturating_sub(start.elapsed()).min(Duration::from_millis(500));
+        let total_count = tokio::time::timeout(count_budget, self.count(&query.text)).await.ok().and_then(Result::ok);
 
         let query_time_ms = start.elapsed().as_millis() as u64;
 
@@ -200,47 +204,12 @@ impl IndexProvider for EverythingCliAdapter {
             results,
             total_count,
             query_time_ms,
-            partial: results_count >= query.max_results,
+            partial: total_count.map_or(true, |count| query.offset.saturating_add(results_count) < count),
         })
     }
 
     async fn stats(&self) -> VelocityResult<IndexStats> {
-        // Try to get actual total count using es.exe count flag
-        // First try: use -c flag for count (es.exe 1.1.0.18+)
-        let count_output = Command::new(&self.es_path)
-            .args(["-c", ""])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await
-            .ok()
-            .and_then(|output| {
-                if output.status.success() {
-                    String::from_utf8(output.stdout).ok()
-                } else {
-                    None
-                }
-            })
-            .and_then(|stdout| stdout.trim().parse::<u64>().ok());
-
-        let total_files = if let Some(count) = count_output {
-            count
-        } else {
-            // Fallback: use search with reasonable max_results
-            let max_results = 10000;
-            let query = SearchQuery {
-                text: String::new(),
-                max_results,
-                offset: 0,
-            };
-            let results = self.search(query).await?;
-            let total_count = results.total_count;
-            if total_count < max_results {
-                total_count as u64
-            } else {
-                total_count as u64 // At least this many
-            }
-        };
+        let total_files = self.count("").await? as u64;
 
         Ok(IndexStats {
             total_files,
@@ -254,18 +223,15 @@ impl IndexProvider for EverythingCliAdapter {
     }
 
     async fn reindex(&self) -> VelocityResult<()> {
-        info!("Reindex requested - Everything handles this automatically");
-        Ok(())
+        Err(VelocityError::NotImplemented("Reindexing through the Everything adapter".into()))
     }
 
     async fn pause_indexing(&self) -> VelocityResult<()> {
-        warn!("Pause indexing not supported via Everything CLI");
-        Ok(())
+        Err(VelocityError::NotImplemented("Pausing Everything indexing".into()))
     }
 
     async fn resume_indexing(&self) -> VelocityResult<()> {
-        warn!("Resume indexing not supported via Everything CLI");
-        Ok(())
+        Err(VelocityError::NotImplemented("Resuming Everything indexing".into()))
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -308,6 +274,6 @@ mod tests {
         let adapter = EverythingCliAdapter::new(None);
         let query = SearchQuery { text: "-exit".into(), max_results: 25, offset: 10 };
         assert_eq!(adapter.build_search_args(&query),
-            ["-n", "25", "-s", "-o", "10", "--", "-exit"]);
+            ["-n", "35", "-s", "-viewport-offset", "10", "--", "-exit"]);
     }
 }

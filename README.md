@@ -62,7 +62,7 @@ cd velocity
 # Download from https://www.voidtools.com/ and place es.exe in:
 # - Same directory as velocity executable, OR
 # - C:\Program Files\Everything\es.exe, OR
-# - D:\Everything\es.exe
+# - A directory on PATH
 
 # Build release version
 cargo build --release
@@ -97,17 +97,13 @@ See [Everything Search Syntax](https://www.voidtools.com/support/everything/sear
 
 ## Configuration
 
-Configuration file location:
-- Windows: `%APPDATA%\velocity\config.toml`
+Place `config.toml` beside `velocity-ui.exe`. If it exists, it takes precedence over the legacy `excludes.txt`, `drives.txt`, and `hotkey.txt` files in the same directory. Omitted TOML fields use defaults. Currently only `ui.max_results` affects searches; the hotkey is fixed to Alt+Space. Configure drives and exclusions in Everything itself: Velocity does not yet apply its own drive or exclusion settings.
 
 Example `config.toml`:
 ```toml
 [ui]
 max_results = 100
-hover_delay_ms = 150
-
-[hotkey]
-key = "Alt+Space"
+# Other UI settings are not yet implemented.
 ```
 
 ## Development

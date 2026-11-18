@@ -134,6 +134,9 @@ fn main() -> VelocityResult<()> {
     let runtime_handle_tray = runtime_handle.clone();
 
     let config = Config::load()?;
+    if !config.hotkey.key.eq_ignore_ascii_case("Alt+Space") {
+        return Err(VelocityError::Config("Only the Alt+Space hotkey is currently supported".into()));
+    }
     let max_results = config.ui.max_results;
     let provider = Arc::new(EverythingCliAdapter::new(None)
         .with_max_results(max_results)

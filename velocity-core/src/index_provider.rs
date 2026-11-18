@@ -22,7 +22,8 @@ pub struct SearchResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResults {
     pub results: Vec<SearchResult>,
-    pub total_count: usize,
+    /// Exact matching count when available. None means the provider could not determine it.
+    pub total_count: Option<usize>,
     pub query_time_ms: u64,
     pub partial: bool,
 }

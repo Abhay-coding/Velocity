@@ -231,6 +231,37 @@ impl Config {
         Ok(())
     }
 
+    fn parse_toml(content: &str) -> VelocityResult<Self> {
+        fn merge(default: &mut toml::Value, overrides: toml::Value) {
+            match (default, overrides) {
+                (toml::Value::Table(base), toml::Value::Table(user)) => {
+                    for (key, value) in user {
+                        if let Some(existing) = base.get_mut(&key) { merge(existing, value); }
+                        else { base.insert(key, value); }
+                    }
+                }
+                (base, value) => *base = value,
+            }
+        }
+        let mut user: toml::Value = toml::from_str(content)
+            .map_err(|e| VelocityError::Config(format!("Failed to parse config.toml: {}", e)))?;
+        if let Some(hotkey) = user.get_mut("hotkey").and_then(toml::Value::as_table_mut) {
+            if !hotkey.contains_key("modifiers") {
+                if let Some(key) = hotkey.get("key").and_then(toml::Value::as_str) {
+                    let components = key.split('+').map(|part| toml::Value::String(part.trim().to_string())).collect();
+                    hotkey.insert("modifiers".into(), toml::Value::Array(components));
+                }
+            }
+        }
+        let mut merged = toml::Value::try_from(Self::default())
+            .map_err(|e| VelocityError::Config(format!("Failed to prepare default config: {}", e)))?;
+        merge(&mut merged, user);
+        let config: Self = merged.try_into()
+            .map_err(|e| VelocityError::Config(format!("Failed to parse config.toml: {}", e)))?;
+        config.validate()?;
+        Ok(config)
+    }
+
     pub fn load() -> VelocityResult<Self> {
         let exe_dir = std::env::current_exe()?
             .parent()
@@ -243,9 +274,7 @@ impl Config {
 
         if config_path.exists() {
             let content = std::fs::read_to_string(&config_path)?;
-            let toml_config: Config = toml::from_str(&content)
-                .map_err(|e| VelocityError::Config(format!("Failed to parse config.toml: {}", e)))?;
-            config = toml_config;
+            config = Self::parse_toml(&content)?;
         } else {
             // Fallback: load individual files for backwards compatibility
             // Try to load excludes.txt
@@ -327,6 +356,20 @@ mod tests {
     #[test]
     fn default_config_is_valid() {
         Config::default().validate().expect("default config must be usable");
+    }
+
+    #[test]
+    fn partial_toml_uses_nested_defaults() {
+        let config = Config::parse_toml("[ui]\nmax_results = 25\n[hotkey]\nkey = \"Alt+Space\"\n").unwrap();
+        assert_eq!(config.ui.max_results, 25);
+        assert_eq!(config.ui.hover_delay_ms, Config::default().ui.hover_delay_ms);
+        assert_eq!(config.hotkey.modifiers, ["Alt", "Space"]);
+    }
+
+    #[test]
+    fn partial_toml_derives_hotkey_components_from_key() {
+        let config = Config::parse_toml("[hotkey]\nkey = \"Ctrl+Space\"\n").unwrap();
+        assert_eq!(config.hotkey.modifiers, ["Ctrl", "Space"]);
     }
 
     #[test]
