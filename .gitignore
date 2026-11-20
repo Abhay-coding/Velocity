@@ -1,68 +1,40 @@
-# Rust target directory
-target/
+# Build output and local tooling
+/target/
+/.cargo/registry/
+/.vscode/
+/.idea/
+*.exe
+*.dll
+*.lib
+*.pdb
 
-# Cargo lock file (optional - some projects commit it, some don't)
-Cargo.lock
+# Local configuration and credentials
+/config.toml
+/drives.txt
+/excludes.txt
+/hotkey.txt
+.env
+.env.*
+!.env.example
 
-# IDE and editor files
-.vscode/
-.idea/
+# Test output, logs and temporary files
+/coverage/
+*.profraw
+*.profdata
+*.log
+*.tmp
+*.temp
 *.swp
 *.swo
 *~
-
-# OS-specific files
-.DS_Store
-Thumbs.db
-
-# Build artifacts
-*.lib
-*.dll
-*.exe
-*.pdb
-
-# Temporary files
-*.tmp
-*.temp
-
-# Log files
-*.log
-
-# Environment files
-.env
-.env.local
-
-# Test output
-coverage/
-*.profraw
-*.profdata
-
-# Clippy cache
-.clippy/
-
-# Rust analyzer cache
-rust-analyzer/
-
-# Cargo registry cache (if using offline mirror)
-.cargo/registry/
-
-# Slint build output (generated UI code)
-**/target/debug/build/velocity-ui-*/out/
-**/target/release/build/velocity-ui-*/out/
-
-# Backup files
 *.bak
 *.backup
 
-# MFT test output (run with admin privileges)
-velocity/target/debug/examples/test_mft.exe
-velocity/target/release/examples/test_mft.exe
-
-# Admin/sudo required files (Windows)
-*.manifest
-
-# Windows reserved names and accidental files
-nul
-u64
-self
-*provider*capabilities*
+# OS and stray shell artifacts
+.DS_Store
+Thumbs.db
+/nul
+/Self
+/String
+/ProviderCapabilities
+/query.max_results

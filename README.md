@@ -1,234 +1,63 @@
 # Velocity Search
 
-A lightning-fast desktop file search application for Windows, built with Rust and Slint.
+A keyboard-first Windows desktop app for finding files and folders. Velocity presents the index maintained by [Everything](https://www.voidtools.com/) in a resizable Slint interface built with Rust.
 
-## Overview
+![Velocity Search showing file results and the selected file’s details](docs/screenshots/search-results.jpg)
 
-Velocity Search provides instant file search capabilities using the Everything search engine backend. It features a clean, minimal UI with keyboard-driven workflow for power users.
+*Desktop screenshot with synthetic project files.*
 
-![Velocity Search](docs/screenshot.png)
+## What you can do
 
-## Features
+- Search by filename or use [Everything search syntax](https://www.voidtools.com/support/everything/search_syntax/), such as `ext:pdf budget`.
+- Narrow the displayed results to files or folders. The filter applies to the current result page.
+- Inspect a selection’s path, size, and modification time in the details pane. Compact windows give the full width to the results list.
+- Open a result or its containing folder from the keyboard or the action buttons.
+- Switch between light and dark appearance from the window or the system tray.
 
-- **Instant Search**: Sub-millisecond search results using Everything's indexed database
-- **Keyboard-First**: Global hotkey (Alt+Space) to open, type to search, Enter to open, Esc to close
-- **Clean UI**: Minimal, distraction-free interface built with Slint
-- **File Preview**: Quick preview of file metadata (size, modified date, type)
-- **Cross-Platform Core**: Rust core with Windows-specific UI (extensible to other platforms)
-- **MFT Parser (Learning)**: NTFS Master File Table parser for future native indexing
+![Compact window with the selected row visible after keyboard navigation](docs/screenshots/compact-layout.jpg)
 
-## Architecture
+## Get started
 
-```
-velocity/
-├── velocity-core/      # Core library: config, error handling, index provider traits
-├── velocity-ui/        # Slint-based desktop UI (Windows)
-├── velocity-everything/# Everything CLI adapter (production backend)
-└── velocity-mft/       # NTFS MFT parser (learning project, not production)
-```
+1. Install and start [Everything](https://www.voidtools.com/downloads/). Let it finish indexing.
+2. Download a current [Everything command-line client](https://www.voidtools.com/support/everything/command_line_interface/). Put `es.exe` beside `velocity-ui.exe` or on `PATH`. To point Velocity at a specific executable, set `VELOCITY_ES_PATH` to its full path.
+3. From this repository’s root, build and run the Windows app with the Rust MSVC toolchain and Visual Studio C++ Build Tools.
 
-### Backend
-
-The production backend uses **Everything CLI** (`es.exe`) from voidtools.com, which provides:
-- NTFS USN Journal-based real-time indexing
-- Instant search across all local drives
-- Advanced query syntax (operators, wildcards, regex)
-- Minimal resource usage
-
-### Future Backend
-
-The `velocity-mft` crate is a learning project implementing direct NTFS MFT parsing for a future native Rust backend that won't require external dependencies.
-
-## Requirements
-
-- **Windows 10/11** (UI currently Windows-only)
-- **Everything Search** installed from [voidtools.com](https://www.voidtools.com/)
-- **Rust 1.75+** (for building from source)
-
-## Installation
-
-### From Release (Recommended)
-
-Download the latest release from the [releases page](#) (when available).
-
-### From Source
-
-```bash
-# Clone the repository
-git clone https://github.com/yourusername/velocity.git
-cd velocity
-
-# Install Everything CLI (es.exe) - required for search functionality
-# Download from https://www.voidtools.com/ and place es.exe in:
-# - Same directory as velocity executable, OR
-# - C:\Program Files\Everything\es.exe, OR
-# - A directory on PATH
-
-# Build release version
-cargo build --release
-
-# Run
-./target/release/velocity-ui.exe
+```powershell
+cargo build --release --locked -p velocity-ui
+.\target\release\velocity-ui.exe
 ```
 
-## Usage
+The workspace is tested on Windows with Rust 1.97.1. Everything and its command-line client are separate from Velocity.
 
-1. **Launch** the application (runs in background)
-2. **Press Alt+Space** to open the search window
-3. **Type** your search query
-4. **Navigate** results with arrow keys
-5. **Press Enter** to open file/folder
-6. **Press Esc** to close window
+| Input | Action |
+| --- | --- |
+| Alt+Space | Show the search window |
+| ↑ / ↓, Page Up / Page Down | Move through results |
+| Enter or double-click | Open the selected result |
+| Ctrl+Enter | Open its containing folder |
+| Escape | Hide the window |
 
-### Search Syntax
+Use **Show search** in the system tray to bring the window back, or **Quit Velocity Search** to exit. If search fails, check the Everything prerequisites and select **Retry**.
 
-Velocity inherits Everything's powerful query syntax:
-
-| Syntax | Example | Description |
-|--------|---------|-------------|
-| `text` | `report` | Search by name |
-| `ext:` | `ext:pdf` | Filter by extension |
-| `path:` | `path:src` | Filter by path |
-| `size:` | `size:>10mb` | Filter by size |
-| `dm:` | `dm:lastweek` | Filter by date modified |
-| `regex:` | `regex:\d{4}-\d{2}` | Regular expression |
-
-See [Everything Search Syntax](https://www.voidtools.com/support/everything/search_syntax/) for complete reference.
+![Backend error state with a retry button](docs/screenshots/backend-error.jpg)
 
 ## Configuration
 
-Place `config.toml` beside `velocity-ui.exe`. If it exists, it takes precedence over the legacy `excludes.txt`, `drives.txt`, and `hotkey.txt` files in the same directory. Omitted TOML fields use defaults. Currently only `ui.max_results` affects searches; the hotkey is fixed to Alt+Space. Configure drives and exclusions in Everything itself: Velocity does not yet apply its own drive or exclusion settings.
-
-Example `config.toml`:
-```toml
-[ui]
-max_results = 100
-# Other UI settings are not yet implemented.
-```
+Copy [config.example.toml](config.example.toml) to `config.toml` beside the executable. The supported desktop options are `ui.max_results` and `ui.theme` (`dark` or `light`). Theme changes made in the window apply to the current session. Configure indexed drives and exclusions in Everything.
 
 ## Development
 
-### Testing the MFT Parser
-
-The `velocity-mft` crate includes a test example that validates the parser against a real NTFS volume (C: drive):
-
-```bash
-# Requires Administrator privileges to access raw volume
-# Open PowerShell as Administrator first, then:
-cd velocity
-cargo run -p velocity-mft --example test_mft
+```powershell
+cargo build --locked --workspace
+cargo test --locked --workspace
+cargo run --locked -p velocity-ui
 ```
 
-This test:
-1. Opens `\\.\C:` for raw MFT access (read-only)
-2. Parses and displays boot sector info (bytes/sector, sectors/cluster, MFT location)
-3. Reads and displays MFT records
-4. Tests path building from parent references
-5. Initializes the full IndexProvider and performs sample searches
+| Crate | Role |
+| --- | --- |
+| [velocity-ui](velocity-ui) | Slint interface, keyboard navigation, tray, and Windows file opening |
+| [velocity-everything](velocity-everything) | Process adapter for the Everything CLI |
+| [velocity-core](velocity-core) | Provider interface, data types, and configuration |
+| [velocity-mft](velocity-mft) | Experimental NTFS parser and synthetic record tests |
 
-**Note**: The full drive indexing in step 5 scans the entire MFT and can take 10+ minutes on large drives. Press Ctrl+C to stop after verifying the core parser works (steps 1-4 complete in seconds).
-
-### Project Structure
-
-```
-velocity/
-├── Cargo.toml              # Workspace manifest
-├── .gitignore
-├── velocity-core/
-│   ├── Cargo.toml
-│   └── src/
-│       ├── lib.rs          # Core exports
-│       ├── config.rs       # Configuration management
-│       ├── error.rs        # Error types
-│       └── index_provider.rs # Index provider trait
-├── velocity-ui/
-│   ├── Cargo.toml
-│   ├── build.rs            # Slint build script
-│   ├── ui/
-│   │   └── ui.slint        # Slint UI definition
-│   └── src/
-│       └── main.rs         # UI entry point
-├── velocity-everything/
-│   ├── Cargo.toml
-│   └── src/
-│       ├── lib.rs
-│       └── cli_adapter.rs  # Everything CLI adapter
-└── velocity-mft/
-    ├── Cargo.toml
-    └── src/
-        └── lib.rs          # MFT parser (learning)
-```
-
-### Building
-
-```bash
-# Debug build
-cargo build
-
-# Release build
-cargo build --release
-
-# Run tests
-cargo test
-
-# Check formatting
-cargo fmt --check
-
-# Run clippy
-cargo clippy
-```
-
-### Running the UI
-
-```bash
-cargo run --bin velocity-ui
-```
-
-## Dependencies
-
-### Runtime
-- **Everything** (voidtools.com) - Required for search functionality
-
-### Build (Rust Crates)
-- `slint` - UI framework
-- `tokio` - Async runtime
-- `tracing` - Logging
-- `chrono` - Date/time handling
-- `rdev` - Global hotkey listener
-- `windows-rs` - Windows API bindings
-- `anyhow`, `thiserror` - Error handling
-- `serde` - Serialization
-
-## Roadmap
-
-- [ ] Native MFT-based backend (remove Everything dependency)
-- [ ] Linux/macOS support with platform-specific backends
-- [ ] Content search (file contents)
-- [ ] Plugin system for custom indexers
-- [ ] Dark/Light theme support
-- [ ] Portable mode (config in exe directory)
-- [ ] Auto-update mechanism
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Run `cargo fmt`, `cargo clippy`, `cargo test`
-5. Submit a pull request
-
-## License
-
-MIT License - see [LICENSE](LICENSE) for details.
-
-## Acknowledgments
-
-- [Everything Search Engine](https://www.voidtools.com/) by voidtools - The incredible search backend
-- [Slint](https://slint.dev/) - The UI framework
-- [Rust](https://www.rust-lang.org/) - The systems programming language
-
-## Support
-
-- **Issues**: [GitHub Issues](#)
-- **Discussions**: [GitHub Discussions](#)
-- **Everything Help**: [voidtools.com/support](https://www.voidtools.com/support/)
+The desktop app uses Everything. The experimental MFT scanner assumes a contiguous MFT and requires elevated access for raw-volume testing.

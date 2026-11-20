@@ -1,3 +1,5 @@
+import { Button, ListView, Palette } from "std-widgets.slint";
+
 struct SearchResultItem {
     name: string,
     path: string,
@@ -7,228 +9,246 @@ struct SearchResultItem {
 }
 
 export component SearchBar inherits Window {
-    in property <string> placeholder: "Search files...";
-    in property <string> hotkey_hint: "Alt+Space";
+    title: "Velocity Search";
+    preferred-width: 920px;
+    preferred-height: 620px;
+    min-width: 420px;
+    min-height: 360px;
+    default-font-family: "Segoe UI";
+    background: canvas;
 
-    // Theme colors
-    in property <brush> bg_color: #fafafa;
-    in property <brush> text_color: #1a1a1a;
-    in property <brush> accent_color: #0078d4;
-    in property <brush> border_color: #e0e0e0;
+    in-out property <bool> dark: true;
+    in property <string> hotkey-hint: "Alt+Space";
+    in property <[SearchResultItem]> search-results: [];
+    in property <bool> searching;
+    in property <int> search-generation;
+    in property <bool> failed;
+    in property <string> status-text;
+    in property <string> result-summary;
+    in property <int> result-filter;
+    property <string> query;
+    property <int> selected: -1;
+    property <length> row-height: 58px;
+    property <bool> wide: true;
+    property <bool> show-shortcuts: true;
+    changed width => { wide = self.width >= 760px; }
+    changed height => { show-shortcuts = self.height >= 470px; }
+    property <bool> has-selection: selected >= 0 && selected < search-results.length;
+    property <SearchResultItem> detail: has-selection ? search-results[selected] : {name: "", path: "", size: "", modified: "", is_directory: false};
 
-    // Search state
-    property <string> search_text: "";
-    in property <int> results_count: 0;
-    in property <bool> searching: false;
-    in property <string> status_text: "";
+    property <color> canvas: dark ? #11191d : #eef5f4;
+    property <color> surface: dark ? #192429 : #ffffff;
+    property <color> raised: dark ? #223138 : #e5efed;
+    property <color> line: dark ? #35474e : #cadbd8;
+    property <color> ink: dark ? #f1f8f6 : #152b2a;
+    property <color> muted: dark ? #afc2c4 : #4f6869;
+    property <color> accent: dark ? #77e4ce : #00685a;
+    property <color> selection: dark ? #23433e : #d4f1e9;
 
-    // Selection state for keyboard navigation
-    in-out property <string> selected_path: "";
-    property <int> selected_index: -1;
+    callback search-requested(string);
+    callback filter-requested(int);
+    callback result-opened(string);
+    callback result-opened-folder(string);
+    callback escape-pressed();
 
-    // Search results model - populated from Rust
-    in property <[SearchResultItem]> search_results: [];
-    changed search_results => { selected_index = -1; selected_path = ""; }
+    public function focus-search() { input.focus(); }
 
-    callback search_requested(string);
-    callback result_selected(string);
-    callback result_opened(string);
-    callback result_opened_folder(string);
-    callback hotkey_pressed();
-    callback escape_pressed();
-    callback selection_changed(string);
-    callback key_up_pressed();
-    callback key_down_pressed();
-    callback key_enter_pressed();
-    callback key_ctrl_enter_pressed();
+    function choose(index: int) {
+        if search-results.length == 0 { return; }
+        selected = clamp(index, 0, search-results.length - 1);
+        let top = selected * row-height + results.content-y;
+        if top < 0px { results.content-y -= top; }
+        if top + row-height > results.visible-height {
+            results.content-y -= top + row-height - results.visible-height;
+        }
+    }
 
-    preferred-width: 640px;
-    preferred-height: 480px;
+    changed search-results => {
+        selected = search-results.length > 0 ? 0 : -1;
+        results.content-y = 0px;
+    }
 
-    background: bg_color;
-    init => { input.focus(); }
+    changed dark => { Palette.color-scheme = dark ? ColorScheme.dark : ColorScheme.light; }
+    init => { Palette.color-scheme = dark ? ColorScheme.dark : ColorScheme.light; input.focus(); }
 
     Rectangle {
-        x: 0;
-        y: 0;
-        width: parent.width;
-        height: parent.height;
-        background: bg_color;
-        border-width: 1px;
-        border-color: border_color;
-        border-radius: 8px;
-
+        width: root.width;
+        height: root.height;
         VerticalLayout {
-            x: 0;
-            y: 0;
-            width: parent.width;
-            height: parent.height;
-            spacing: 8px;
-            padding: 12px;
+            padding: 20px;
+            spacing: 12px;
 
-            // Search input row
             HorizontalLayout {
-                spacing: 8px;
+                alignment: start;
+                spacing: 10px;
                 Rectangle {
-                    width: 32px;
-                    height: 32px;
-                    background: transparent;
-                    Text { text: "🔍"; font-size: 18px; color: #666; horizontal-alignment: center; vertical-alignment: center; }
+                    width: 34px; height: 34px;
+                    border-radius: 9px;
+                    background: accent;
+                    Text { text: "V"; color: canvas; font-size: 21px; font-weight: 800; horizontal-alignment: center; vertical-alignment: center; }
                 }
-                Rectangle {
-                    width: parent.width - 72px;
-                    height: 32px;
-                    background: #ffffff;
-                    border-width: 1px;
-                    border-color: border_color;
-                    border-radius: 4px;
-                    input := TextInput {
-                        x: 4px; y: 0; width: parent.width - 8px; height: 32px;
-                        text <=> search_text; font-size: 16px; color: text_color;
-                        horizontal-alignment: left; vertical-alignment: center;
-                        edited => { selected_index = -1; search_requested(self.text); }
-                        key-pressed(event) => {
-                            if event.text == Key.Escape {
-                                escape_pressed();
-                                return accept;
-                            }
-                            if event.text == Key.DownArrow && search_results.length > 0 {
-                                selected_index = Math.min(selected_index + 1, search_results.length - 1);
-                                selected_path = search_results[selected_index].path;
-                                results_view.content-y = -Math.max(0px, selected_index * 50px - 250px);
-                                return accept;
-                            }
-                            if event.text == Key.UpArrow && search_results.length > 0 {
-                                selected_index = Math.max(selected_index - 1, 0);
-                                selected_path = search_results[selected_index].path;
-                                results_view.content-y = -Math.max(0px, selected_index * 50px - 250px);
-                                return accept;
-                            }
-                            if event.text == Key.Return && search_results.length > 0 {
-                                if selected_index < 0 { selected_index = 0; }
-                                selected_path = search_results[selected_index].path;
-                                if event.modifiers.control { result_opened_folder(selected_path); }
-                                else { result_opened(selected_path); }
-                                return accept;
-                            }
-                            return reject;
-                        }
-                    }
-                }
-                TouchArea {
-                    width: 32px; height: 32px; visible: search_text != "";
-                    clicked => { search_text = ""; search_requested(""); }
-                    Rectangle { width: 32px; height: 32px; background: transparent;
-                        Text { text: "✕"; font-size: 16px; color: #666; horizontal-alignment: center; vertical-alignment: center; }
-                    }
-                }
+                Text { text: "Velocity Search"; color: ink; font-size: 21px; font-weight: 650; vertical-alignment: center; }
+                Rectangle { horizontal-stretch: 1; }
+                Text { text: hotkey-hint; color: muted; font-size: 13px; vertical-alignment: center; }
+                Button { text: dark ? "Light mode" : "Dark mode"; clicked => { dark = !dark; input.focus(); } }
             }
 
-            // RESULTS PANEL - RUST-GENERATED RESULTS VIA FOR LOOP
             Rectangle {
-                width: parent.width;
-                height: 320px;
-                background: #ffffff;
-                border-width: 2px;
-                border-color: border_color;
-                border-radius: 4px;
-                clip: true;
-
-                results_view := Flickable {
-                    width: parent.width;
-                    height: parent.height;
-                    content-height: search_results.length * 50px;
-
-                    VerticalLayout {
-                        width: parent.width;
-                        spacing: 0;
-                        padding: 0;
-
-                        // Results from Rust model - rendered via for loop
-                        for item[index] in search_results : Rectangle {
-                            width: parent.width;
-                            height: 50px;
-                            background: item.path == selected_path ? #e3f2fd : #f8f9fa;
-                            border-width: 1px;
-                            border-color: item.path == selected_path ? accent_color : #e8e8e8;
-
-                            HorizontalLayout {
-                                width: parent.width;
-                                height: parent.height;
-                                spacing: 12px;
-                                padding-left: 12px;
-                                padding-right: 12px;
-                                padding-top: 8px;
-                                padding-bottom: 8px;
-
-                                // File type icon
-                                Rectangle {
-                                    width: 32px;
-                                    height: 32px;
-                                    background: item.is_directory ? accent_color : #6c757d;
-                                    border-radius: 4px;
-                                    Text {
-                                        text: item.is_directory ? "📁" : "📄";
-                                        font-size: 16px;
-                                        color: #ffffff;
-                                        horizontal-alignment: center;
-                                        vertical-alignment: center;
-                                    }
+                height: 52px;
+                background: surface;
+                border-color: input.has-focus ? accent : line;
+                border-width: 1px;
+                border-radius: 10px;
+                HorizontalLayout {
+                    padding-left: 13px; padding-right: 6px;
+                    spacing: 8px;
+                    Text { text: "Search"; color: accent; font-weight: 650; font-size: 14px; vertical-alignment: center; }
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        Text {
+                            text: "Files, folders, or ext:pdf";
+                            color: muted; font-size: 16px; vertical-alignment: center;
+                            visible: query == "";
+                        }
+                        input := TextInput {
+                            width: parent.width; height: parent.height;
+                            text <=> query;
+                            color: ink; font-size: 16px; single-line: true;
+                            vertical-alignment: center;
+                            accessible-role: text-input;
+                            accessible-label: "Search files and folders";
+                            edited => { search-requested(query); }
+                            key-pressed(event) => {
+                                if event.text == Key.Escape { escape-pressed(); return accept; }
+                                if event.text == Key.DownArrow { choose(selected + 1); return accept; }
+                                if event.text == Key.UpArrow { choose(selected - 1); return accept; }
+                                if event.text == Key.PageDown { choose(selected + max(1, floor(results.visible-height / row-height))); return accept; }
+                                if event.text == Key.PageUp { choose(selected - max(1, floor(results.visible-height / row-height))); return accept; }
+                                if event.text == Key.Return {
+                                    if has-selection {
+                                        if event.modifiers.control { result-opened-folder(detail.path); }
+                                        else { result-opened(detail.path); }
+                                    } else if failed { search-requested(query); }
+                                    return accept;
                                 }
-
-                                // File info
-                                VerticalLayout {
-                                    width: parent.width - 56px;
-                                    spacing: 2px;
-                                    Text {
-                                        text: item.name;
-                                        font-size: 14px;
-                                        color: item.path == selected_path ? accent_color : text_color;
-                                        font-weight: 500;
-                                    }
-                                    HorizontalLayout {
-                                        spacing: 16px;
-                                        Text {
-                                            text: item.size;
-                                            font-size: 12px;
-                                            color: #888;
-                                        }
-                                        Text {
-                                            text: item.modified;
-                                            font-size: 12px;
-                                            color: #888;
-                                        }
-                                    }
-                                }
-
-                                // Click area
-                                TouchArea {
-                                    width: parent.width;
-                                    height: parent.height;
-                                    clicked => {
-                                        root.result_selected(item.path);
-                                        selected_index = index;
-                                        selected_path = item.path;
-                                        selection_changed(item.path);
-                                    }
-                                }
+                                return reject;
                             }
                         }
                     }
+                    Button {
+                        text: "Clear"; enabled: query != "";
+                        clicked => { query = ""; search-requested(query); input.focus(); }
+                    }
                 }
             }
 
-            // Preview pane - hidden for debugging
-            Rectangle {
-                visible: false;
-                height: 0;
+            HorizontalLayout {
+                spacing: 6px;
+                alignment: start;
+                for label[index] in ["All", "Files", "Folders"]: Button {
+                    text: label;
+                    primary: result-filter == index;
+                    clicked => { filter-requested(index); input.focus(); }
+                }
+                Rectangle { horizontal-stretch: 1; }
+                if wide: Text { text: "Filter displayed results"; color: muted; vertical-alignment: center; font-size: 12px; }
             }
 
-            // Status bar
             HorizontalLayout {
                 spacing: 12px;
-                Text { text: status_text; font-size: 12px; color: #888; }
-                Text { text: "Alt+Space to open | ↑↓ navigate | Enter open | Ctrl+Enter open folder | Esc to close"; font-size: 11px; color: #aaa; }
+                vertical-stretch: 1;
+                Rectangle {
+                    background: surface; border-radius: 10px; border-color: line; border-width: 1px;
+                    horizontal-stretch: 3;
+                    clip: true;
+                    results := ListView {
+                        x: 1px; y: 1px; width: parent.width - 2px; height: parent.height - 2px;
+                        for item[index] in search-results: Rectangle {
+                            height: row-height;
+                            background: selected == index ? selection : row.has-hover ? raised : surface;
+                            accessible-role: list-item;
+                            accessible-label: item.name + ", " + item.path;
+                            HorizontalLayout {
+                                padding-left: 12px; padding-right: 12px; spacing: 12px;
+                                Rectangle {
+                                    width: 44px; height: 30px; border-radius: 6px;
+                                    background: raised;
+                                    Text {
+                                        text: item.is_directory ? "DIR" : "FILE";
+                                        color: accent; font-size: 11px; font-weight: 700;
+                                        horizontal-alignment: center; vertical-alignment: center;
+                                    }
+                                }
+                                VerticalLayout {
+                                    alignment: center; spacing: 3px; horizontal-stretch: 1;
+                                    Text { text: item.name; color: ink; font-weight: 600; font-size: 15px; overflow: elide; }
+                                    Text { text: item.path; color: muted; font-size: 12px; overflow: elide; }
+                                }
+                                if wide: Text { text: item.size; color: muted; font-size: 12px; vertical-alignment: center; }
+                            }
+                            row := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { selected = index; input.focus(); }
+                                double-clicked => { result-opened(item.path); }
+                            }
+                        }
+                    }
+                    if search-results.length == 0: VerticalLayout {
+                        alignment: center; padding: 16px; spacing: 8px;
+                        Text {
+                            text: searching ? "Searching…" : failed ? "Search unavailable" :
+                                query == "" ? "Find your files" : result-summary != "" ? "No matching results" : "Enter a search term";
+                            color: ink; font-size: 20px; font-weight: 650; horizontal-alignment: center; wrap: word-wrap;
+                        }
+                        Text {
+                            text: searching ? "Waiting for Everything" : failed ? "Check that Everything is running and es.exe is available." :
+                                query == "" ? "Type at least two characters to search by name." :
+                                result-filter != 0 ? "Try the All filter or change your search." : "Try a different name or file extension.";
+                            color: muted; font-size: 13px; horizontal-alignment: center; wrap: word-wrap;
+                        }
+                        if failed && query != "": HorizontalLayout {
+                            alignment: center;
+                            Button { text: "Retry"; clicked => { search-requested(query); input.focus(); } }
+                        }
+                    }
+                }
+
+                if wide: Rectangle {
+                    width: 254px;
+                    background: surface; border-radius: 10px; border-color: line; border-width: 1px;
+                    clip: true;
+                    VerticalLayout {
+                        padding: 14px; spacing: 9px; alignment: start;
+                        Text { text: "Details"; font-size: 13px; font-weight: 700; color: accent; }
+                        Text { text: has-selection ? detail.name : "Select a result"; font-size: 18px; font-weight: 650; color: ink; overflow: elide; }
+                        if has-selection: Text {
+                            text: detail.is_directory ? "Folder" : detail.size != "" ? "File  ·  " + detail.size : "File";
+                            font-size: 13px; color: muted;
+                        }
+                        if has-selection && detail.modified != "": Text {
+                            text: "Modified " + detail.modified; font-size: 13px; color: muted; overflow: elide;
+                        }
+                        if has-selection: Text {
+                            text: detail.path; font-size: 13px; color: muted; wrap: char-wrap; overflow: elide;
+                        }
+                    }
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 8px;
+                Text {
+                    text: status-text != "" ? status-text : result-summary;
+                    color: failed ? (dark ? #ffb5a9 : #9b2c18) : muted;
+                    font-size: 12px; overflow: elide; horizontal-stretch: 1; vertical-alignment: center;
+                }
+                Button { text: "Folder"; enabled: has-selection; clicked => { result-opened-folder(detail.path); input.focus(); } }
+                Button { text: "Open"; enabled: has-selection; clicked => { result-opened(detail.path); input.focus(); } }
+            }
+
+            if wide && show-shortcuts: Text {
+                text: "↑ ↓  Select     Enter  Open     Ctrl+Enter  Containing folder     Esc  Hide";
+                color: muted; font-size: 12px;
             }
         }
     }

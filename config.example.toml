@@ -1,0 +1,4 @@
+[ui]
+# Use "light" or "dark" to choose a startup appearance.
+theme = "dark"
+max_results = 100
