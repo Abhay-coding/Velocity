@@ -13,8 +13,8 @@ pub struct SearchQuery {
 pub struct SearchResult {
     pub name: String,
     pub path: PathBuf,
-    pub size: u64,
-    pub modified: u64, // Unix timestamp
+    pub size: Option<u64>,
+    pub modified: Option<u64>, // Unix timestamp
     pub extension: Option<String>,
     pub is_directory: bool,
 }

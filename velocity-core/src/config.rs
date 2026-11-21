@@ -10,6 +10,23 @@ pub struct Config {
     pub drives: DriveConfig,
     pub indexing: IndexingConfig,
     pub ui: UiConfig,
+    #[serde(default)]
+    pub search: SearchConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SearchConfig {
+    pub backend: SearchBackend,
+    pub roots: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchBackend {
+    #[default]
+    Native,
+    Everything,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,7 +115,7 @@ impl DriveConfig {
                 return Err(VelocityError::Config("Drive path cannot be empty".to_string()));
             }
             // Basic validation for Windows drive format (e.g., "C:", "D:")
-            if drive.len() < 2 || !drive.ends_with(':') {
+            if !matches!(drive.as_bytes(), [letter, b':'] if letter.is_ascii_alphabetic()) {
                 return Err(VelocityError::Config(format!("Invalid drive format: {}", drive)));
             }
         }
@@ -180,6 +197,7 @@ impl UiConfig {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            search: SearchConfig::default(),
             hotkey: HotkeyConfig {
                 key: "Alt+Space".to_string(),
                 modifiers: vec!["Alt".to_string(), "Space".to_string()],
@@ -228,6 +246,9 @@ impl Config {
         self.drives.validate()?;
         self.indexing.validate()?;
         self.ui.validate()?;
+        if self.search.roots.iter().any(|path| !path.is_absolute()) {
+            return Err(VelocityError::Config("Search roots must be absolute paths".into()));
+        }
         Ok(())
     }
 

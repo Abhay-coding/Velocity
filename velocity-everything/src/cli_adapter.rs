@@ -98,12 +98,11 @@ impl EverythingCliAdapter {
             // Use tokio::fs::metadata for non-blocking I/O
             let metadata = tokio::fs::metadata(&path).await.ok();
             let is_directory = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-            let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+            let size = metadata.as_ref().map(|m| m.len());
             let modified = metadata
                 .and_then(|m| m.modified().ok())
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
+                .map(|d| d.as_secs());
 
             let extension = path
                 .extension()

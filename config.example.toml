@@ -1,3 +1,7 @@
+[search]
+# Use absolute paths. TOML single quotes keep Windows backslashes literal.
+roots = ['C:\Users\you\Documents']
+
 [ui]
 # Use "light" or "dark" to choose a startup appearance.
 theme = "dark"

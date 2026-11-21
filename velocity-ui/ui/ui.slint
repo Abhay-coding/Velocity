@@ -1,17 +1,37 @@
 import { Button, ListView, Palette } from "std-widgets.slint";
 
 struct SearchResultItem {
+    id: int,
     name: string,
     path: string,
+    location: string,
     size: string,
     modified: string,
     is_directory: bool,
 }
 
+component EntryIcon inherits Rectangle {
+    in property <bool> folder;
+    in property <color> tint;
+    in property <color> tile;
+    width: 34px;
+    height: 34px;
+    border-radius: 8px;
+    background: tile;
+    Path {
+        x: 7px; y: 7px; width: 20px; height: 20px;
+        stroke: tint; stroke-width: 1.5px;
+        viewbox-width: 20; viewbox-height: 20;
+        commands: folder
+            ? "M 2 5 Q 2 4 3 4 H 7 L 9 6 H 17 Q 18 6 18 7 V 15 Q 18 16 17 16 H 3 Q 2 16 2 15 Z"
+            : "M 5 2 H 12 L 16 6 V 17 Q 16 18 15 18 H 5 Q 4 18 4 17 V 3 Q 4 2 5 2 Z M 11 2 V 7 H 16 M 7 11 H 13 M 7 14 H 12";
+    }
+}
+
 export component SearchBar inherits Window {
     title: "Velocity Search";
-    preferred-width: 920px;
-    preferred-height: 620px;
+    preferred-width: 984px;
+    preferred-height: 640px;
     min-width: 420px;
     min-height: 360px;
     default-font-family: "Segoe UI";
@@ -24,6 +44,10 @@ export component SearchBar inherits Window {
     in property <int> search-generation;
     in property <bool> failed;
     in property <string> status-text;
+    in property <string> coverage;
+    in property <bool> native-backend;
+    in property <bool> index-paused;
+    in property <bool> index-needs-retry;
     in property <string> result-summary;
     in property <int> result-filter;
     property <string> query;
@@ -31,27 +55,36 @@ export component SearchBar inherits Window {
     property <length> row-height: 58px;
     property <bool> wide: true;
     property <bool> show-shortcuts: true;
-    changed width => { wide = self.width >= 760px; }
+    changed width => { wide = self.width >= 780px; }
     changed height => { show-shortcuts = self.height >= 470px; }
     property <bool> has-selection: selected >= 0 && selected < search-results.length;
-    property <SearchResultItem> detail: has-selection ? search-results[selected] : {name: "", path: "", size: "", modified: "", is_directory: false};
+    property <SearchResultItem> detail: has-selection ? search-results[selected] : {id: -1, name: "", path: "", location: "", size: "", modified: "", is_directory: false};
 
-    property <color> canvas: dark ? #11191d : #eef5f4;
-    property <color> surface: dark ? #192429 : #ffffff;
-    property <color> raised: dark ? #223138 : #e5efed;
-    property <color> line: dark ? #35474e : #cadbd8;
-    property <color> ink: dark ? #f1f8f6 : #152b2a;
-    property <color> muted: dark ? #afc2c4 : #4f6869;
-    property <color> accent: dark ? #77e4ce : #00685a;
-    property <color> selection: dark ? #23433e : #d4f1e9;
+    property <color> canvas: dark ? #101522 : #f0f3f9;
+    property <color> surface: dark ? #171e2e : #ffffff;
+    property <color> raised: dark ? #202a40 : #e9eef8;
+    property <color> line: dark ? #303c55 : #d8e0ee;
+    property <color> ink: dark ? #f3f6ff : #19253a;
+    property <color> muted: dark ? #b0bdd6 : #52617b;
+    property <color> accent: dark ? #a8bdff : #3557b8;
+    property <color> accent-fill: dark ? #a8bdff : #3557b8;
+    property <color> accent-ink: dark ? #141e40 : #ffffff;
+    property <color> selection: dark ? #263759 : #e5edff;
+    property <color> folder-ink: dark ? #ffd196 : #854614;
+    property <color> folder-tile: dark ? #352c2c : #fff0dd;
+    property <color> danger: dark ? #ffb6b4 : #a02c37;
 
     callback search-requested(string);
     callback filter-requested(int);
-    callback result-opened(string);
-    callback result-opened-folder(string);
+    callback result-opened(int);
+    callback result-opened-folder(int);
+    callback details-requested(int);
+    callback retry-requested();
+    callback pause-requested();
     callback escape-pressed();
 
     public function focus-search() { input.focus(); }
+    public function refresh-search() { if query != "" { search-requested(query); } }
 
     function choose(index: int) {
         if search-results.length == 0 { return; }
@@ -75,45 +108,65 @@ export component SearchBar inherits Window {
         width: root.width;
         height: root.height;
         VerticalLayout {
-            padding: 20px;
-            spacing: 12px;
+            width: parent.width;
+            height: parent.height;
+            padding: wide ? 24px : 16px;
+            spacing: wide ? 14px : 10px;
 
             HorizontalLayout {
-                alignment: start;
-                spacing: 10px;
+                spacing: 12px;
                 Rectangle {
-                    width: 34px; height: 34px;
-                    border-radius: 9px;
-                    background: accent;
-                    Text { text: "V"; color: canvas; font-size: 21px; font-weight: 800; horizontal-alignment: center; vertical-alignment: center; }
+                    width: 38px; height: 38px;
+                    border-radius: 10px;
+                    background: accent-fill;
+                    Path {
+                        x: 9px; y: 9px; width: 20px; height: 20px;
+                        viewbox-width: 20; viewbox-height: 20;
+                        fill: accent-ink;
+                        commands: "M 2 3 H 6 L 10 13 L 14 3 H 18 L 11.5 17 H 8.5 Z";
+                    }
                 }
-                Text { text: "Velocity Search"; color: ink; font-size: 21px; font-weight: 650; vertical-alignment: center; }
-                Rectangle { horizontal-stretch: 1; }
-                Text { text: hotkey-hint; color: muted; font-size: 13px; vertical-alignment: center; }
+                Text { text: "Velocity Search"; color: ink; font-size: 22px; font-weight: 650; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                if wide: Rectangle {
+                    width: 82px; height: 28px;
+                    border-radius: 6px; border-width: 1px; border-color: line; background: surface;
+                    Text { text: hotkey-hint; color: muted; font-size: 12px; horizontal-alignment: center; vertical-alignment: center; }
+                }
                 Button { text: dark ? "Light mode" : "Dark mode"; clicked => { dark = !dark; input.focus(); } }
             }
 
             Rectangle {
-                height: 52px;
+                height: wide ? 60px : 50px;
                 background: surface;
                 border-color: input.has-focus ? accent : line;
                 border-width: 1px;
-                border-radius: 10px;
+                border-radius: 12px;
                 HorizontalLayout {
-                    padding-left: 13px; padding-right: 6px;
-                    spacing: 8px;
-                    Text { text: "Search"; color: accent; font-weight: 650; font-size: 14px; vertical-alignment: center; }
+                    padding-left: 16px; padding-right: 10px;
+                    spacing: 12px;
+                    Rectangle {
+                        width: 22px;
+                        Path {
+                            x: 0px; y: (parent.height - 20px) / 2;
+                            width: 20px; height: 20px;
+                            viewbox-width: 20; viewbox-height: 20;
+                            stroke: accent; stroke-width: 1.7px;
+                            commands: "M 14 8.5 A 5.5 5.5 0 1 1 3 8.5 A 5.5 5.5 0 1 1 14 8.5 Z M 12.5 12.5 L 17.5 17.5";
+                        }
+                    }
                     Rectangle {
                         horizontal-stretch: 1;
                         Text {
-                            text: "Files, folders, or ext:pdf";
-                            color: muted; font-size: 16px; vertical-alignment: center;
+                            text: "Search files and folders";
+                            color: muted; font-size: 17px; vertical-alignment: center;
                             visible: query == "";
                         }
                         input := TextInput {
                             width: parent.width; height: parent.height;
                             text <=> query;
-                            color: ink; font-size: 16px; single-line: true;
+                            color: ink; font-size: 18px; single-line: true;
+                            selection-background-color: accent-fill;
+                            selection-foreground-color: accent-ink;
                             vertical-alignment: center;
                             accessible-role: text-input;
                             accessible-label: "Search files and folders";
@@ -126,70 +179,75 @@ export component SearchBar inherits Window {
                                 if event.text == Key.PageUp { choose(selected - max(1, floor(results.visible-height / row-height))); return accept; }
                                 if event.text == Key.Return {
                                     if has-selection {
-                                        if event.modifiers.control { result-opened-folder(detail.path); }
-                                        else { result-opened(detail.path); }
-                                    } else if failed { search-requested(query); }
+                                        if event.modifiers.control { result-opened-folder(detail.id); }
+                                        else { result-opened(detail.id); }
+                                    } else if failed { retry-requested(); }
                                     return accept;
                                 }
                                 return reject;
                             }
                         }
                     }
-                    Button {
-                        text: "Clear"; enabled: query != "";
-                        clicked => { query = ""; search-requested(query); input.focus(); }
+                    if query != "": Rectangle {
+                        width: 54px;
+                        Button {
+                            x: 0px; y: (parent.height - self.height) / 2;
+                            width: parent.width; height: 32px;
+                            text: "Clear";
+                            clicked => { query = ""; search-requested(query); input.focus(); }
+                        }
                     }
                 }
             }
 
             HorizontalLayout {
-                spacing: 6px;
-                alignment: start;
+                spacing: 8px;
                 for label[index] in ["All", "Files", "Folders"]: Button {
                     text: label;
                     primary: result-filter == index;
                     clicked => { filter-requested(index); input.focus(); }
                 }
-                Rectangle { horizontal-stretch: 1; }
-                if wide: Text { text: "Filter displayed results"; color: muted; vertical-alignment: center; font-size: 12px; }
+                Text {
+                    text: searching ? "Searching…" : result-summary;
+                    color: muted; font-size: 13px; horizontal-alignment: right; vertical-alignment: center;
+                    horizontal-stretch: 1; overflow: elide;
+                }
             }
 
             HorizontalLayout {
-                spacing: 12px;
+                spacing: 14px;
                 vertical-stretch: 1;
+                min-height: 0px;
                 Rectangle {
-                    background: surface; border-radius: 10px; border-color: line; border-width: 1px;
+                    background: surface; border-radius: 12px; border-color: line; border-width: 1px;
                     horizontal-stretch: 3;
                     clip: true;
                     results := ListView {
-                        x: 1px; y: 1px; width: parent.width - 2px; height: parent.height - 2px;
+                        x: 1px; y: 6px; width: parent.width - 2px; height: max(0px, parent.height - 12px);
                         for item[index] in search-results: Rectangle {
                             height: row-height;
                             background: selected == index ? selection : row.has-hover ? raised : surface;
                             accessible-role: list-item;
                             accessible-label: item.name + ", " + item.path;
+                            Rectangle { x: 0px; y: 0px; width: 3px; height: parent.height; background: selected == index ? accent-fill : transparent; }
+                            Rectangle { y: parent.height - 1px; x: 12px; width: parent.width - 24px; height: 1px; background: line; }
                             HorizontalLayout {
-                                padding-left: 12px; padding-right: 12px; spacing: 12px;
+                                padding-left: 14px; padding-right: 16px; spacing: 12px;
                                 Rectangle {
-                                    width: 44px; height: 30px; border-radius: 6px;
-                                    background: raised;
-                                    Text {
-                                        text: item.is_directory ? "DIR" : "FILE";
-                                        color: accent; font-size: 11px; font-weight: 700;
-                                        horizontal-alignment: center; vertical-alignment: center;
-                                    }
+                                    width: 34px;
+                                    EntryIcon { x: 0px; y: (parent.height - self.height) / 2; folder: item.is_directory; tint: self.folder ? folder-ink : accent; tile: self.folder ? folder-tile : raised; }
                                 }
                                 VerticalLayout {
                                     alignment: center; spacing: 3px; horizontal-stretch: 1;
                                     Text { text: item.name; color: ink; font-weight: 600; font-size: 15px; overflow: elide; }
-                                    Text { text: item.path; color: muted; font-size: 12px; overflow: elide; }
+                                    Text { text: item.location; color: muted; font-size: 12px; overflow: elide; }
                                 }
-                                if wide: Text { text: item.size; color: muted; font-size: 12px; vertical-alignment: center; }
+                                if wide && item.size != "Unknown size": Text { text: item.size; color: muted; font-size: 12px; vertical-alignment: center; }
                             }
                             row := TouchArea {
                                 mouse-cursor: pointer;
                                 clicked => { selected = index; input.focus(); }
-                                double-clicked => { result-opened(item.path); }
+                                double-clicked => { result-opened(item.id); }
                             }
                         }
                     }
@@ -201,35 +259,40 @@ export component SearchBar inherits Window {
                             color: ink; font-size: 20px; font-weight: 650; horizontal-alignment: center; wrap: word-wrap;
                         }
                         Text {
-                            text: searching ? "Waiting for Everything" : failed ? "Check that Everything is running and es.exe is available." :
+                            text: searching ? "Looking up names" : failed ? status-text :
                                 query == "" ? "Type at least two characters to search by name." :
                                 result-filter != 0 ? "Try the All filter or change your search." : "Try a different name or file extension.";
                             color: muted; font-size: 13px; horizontal-alignment: center; wrap: word-wrap;
                         }
-                        if failed && query != "": HorizontalLayout {
+                        if failed: HorizontalLayout {
                             alignment: center;
-                            Button { text: "Retry"; clicked => { search-requested(query); input.focus(); } }
+                            Button { text: "Retry"; clicked => { retry-requested(); input.focus(); } }
                         }
                     }
                 }
 
                 if wide: Rectangle {
-                    width: 254px;
-                    background: surface; border-radius: 10px; border-color: line; border-width: 1px;
+                    width: 274px;
+                    background: surface; border-radius: 12px; border-color: line; border-width: 1px;
                     clip: true;
                     VerticalLayout {
-                        padding: 14px; spacing: 9px; alignment: start;
-                        Text { text: "Details"; font-size: 13px; font-weight: 700; color: accent; }
-                        Text { text: has-selection ? detail.name : "Select a result"; font-size: 18px; font-weight: 650; color: ink; overflow: elide; }
-                        if has-selection: Text {
+                        padding: 18px; spacing: 10px; alignment: start;
+                        Text { text: "Details"; font-size: 13px; font-weight: 650; color: muted; }
+                        if has-selection: EntryIcon { folder: detail.is_directory; tint: self.folder ? folder-ink : accent; tile: self.folder ? folder-tile : raised; }
+                        Text { text: has-selection ? detail.name : "Select a result"; font-size: 20px; font-weight: 650; color: ink; wrap: word-wrap; max-height: 52px; overflow: elide; }
+                        if has-selection && detail.modified != "Unknown": Text {
                             text: detail.is_directory ? "Folder" : detail.size != "" ? "File  ·  " + detail.size : "File";
                             font-size: 13px; color: muted;
                         }
-                        if has-selection && detail.modified != "": Text {
+                        if has-selection: Text {
                             text: "Modified " + detail.modified; font-size: 13px; color: muted; overflow: elide;
                         }
+                        if has-selection && native-backend && detail.modified == "Unknown": Button {
+                            text: "Load metadata";
+                            clicked => { details-requested(detail.id); input.focus(); }
+                        }
                         if has-selection: Text {
-                            text: detail.path; font-size: 13px; color: muted; wrap: char-wrap; overflow: elide;
+                            text: detail.path; font-size: 13px; color: muted; wrap: char-wrap; overflow: elide; max-height: 80px;
                         }
                     }
                 }
@@ -238,18 +301,22 @@ export component SearchBar inherits Window {
             HorizontalLayout {
                 spacing: 8px;
                 Text {
-                    text: status-text != "" ? status-text : result-summary;
-                    color: failed ? (dark ? #ffb5a9 : #9b2c18) : muted;
+                    text: status-text != "" && !searching ? status-text : wide && show-shortcuts ? "↑ ↓  Select     Enter  Open     Esc  Hide" : "";
+                    color: failed ? danger : muted;
                     font-size: 12px; overflow: elide; horizontal-stretch: 1; vertical-alignment: center;
                 }
-                Button { text: "Folder"; enabled: has-selection; clicked => { result-opened-folder(detail.path); input.focus(); } }
-                Button { text: "Open"; enabled: has-selection; clicked => { result-opened(detail.path); input.focus(); } }
+                Button { text: wide ? "Containing folder" : "Folder"; enabled: has-selection; clicked => { result-opened-folder(detail.id); input.focus(); } }
+                Button { text: "Open"; primary: true; enabled: has-selection; clicked => { result-opened(detail.id); input.focus(); } }
             }
 
-            if wide && show-shortcuts: Text {
-                text: "↑ ↓  Select     Enter  Open     Ctrl+Enter  Containing folder     Esc  Hide";
-                color: muted; font-size: 12px;
+            if coverage != "": Rectangle { height: 1px; background: line; }
+            if coverage != "": HorizontalLayout {
+                spacing: 8px;
+                Text { text: coverage; color: muted; font-size: 12px; wrap: word-wrap; horizontal-stretch: 1; vertical-alignment: center; }
+                if native-backend: Button { text: index-paused ? "Resume" : "Pause"; clicked => { pause-requested(); input.focus(); } }
+                if native-backend: Button { text: index-needs-retry ? "Retry" : "Reindex"; enabled: !index-paused; clicked => { retry-requested(); input.focus(); } }
             }
+
         }
     }
 }

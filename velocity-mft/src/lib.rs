@@ -421,8 +421,8 @@ impl IndexProvider for MftProvider {
             .map(|f| SearchResult {
                 name: f.name.clone(),
                 path: f.path.clone(),
-                size: f.size,
-                modified: f.modified,
+                size: Some(f.size),
+                modified: Some(f.modified),
                 extension: f.extension.clone(),
                 is_directory: f.is_directory,
             })

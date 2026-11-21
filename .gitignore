@@ -3,6 +3,9 @@
 /.cargo/registry/
 /.vscode/
 /.idea/
+/AGENTS.md
+/CLAUDE.md
+/.openqodex/
 *.exe
 *.dll
 *.lib
@@ -38,3 +41,6 @@ Thumbs.db
 /String
 /ProviderCapabilities
 /query.max_results
+
+# Local research and implementation plan
+/docs/standalone-search-plan.md

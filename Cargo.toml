@@ -5,6 +5,7 @@ members = [
     "velocity-core",
     "velocity-everything",
     "velocity-mft",
+    "velocity-native",
 ]
 
 [workspace.dependencies]

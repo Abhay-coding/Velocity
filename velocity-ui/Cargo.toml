@@ -3,9 +3,13 @@ name = "velocity-ui"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+everything = ["dep:velocity-everything"]
+
 [dependencies]
 velocity-core = { path = "../velocity-core" }
-velocity-everything = { path = "../velocity-everything" }
+velocity-everything = { path = "../velocity-everything", optional = true }
+velocity-native = { path = "../velocity-native" }
 slint = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }

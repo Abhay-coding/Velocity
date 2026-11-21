@@ -5602,6 +5602,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "velocity-native"
+version = "0.1.0"
+dependencies = [
+ "glob",
+ "memchr",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "velocity-core",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "velocity-ui"
 version = "0.1.0"
 dependencies = [
@@ -5616,6 +5629,7 @@ dependencies = [
  "tray-icon",
  "velocity-core",
  "velocity-everything",
+ "velocity-native",
 ]
 
 [[package]]
