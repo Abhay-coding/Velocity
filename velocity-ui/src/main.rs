@@ -1,4 +1,4 @@
-use slint::{ComponentHandle, ModelRc, VecModel};
+use slint::{ComponentHandle, Model, ModelRc, VecModel};
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -18,6 +18,9 @@ use velocity_core::{
 #[cfg(feature = "everything")]
 use velocity_everything::EverythingCliAdapter;
 use velocity_native::{FolderProvider, NativeStatus, RootState};
+
+#[cfg(feature = "desktop-acceptance")]
+mod desktop_acceptance;
 
 slint::include_modules!();
 
@@ -269,23 +272,43 @@ fn main() -> VelocityResult<()> {
     let weak = ui.as_weak();
     let handle = runtime.handle().clone();
     let search_provider = provider.clone();
-    let first_paint = Arc::new(Mutex::new(None::<Instant>));
+    let first_paint = Arc::new(Mutex::new(None::<(i32, Instant)>));
     let render_time = first_paint.clone();
-    if let Err(err) = ui.window().set_rendering_notifier(move |state, _| {
+    #[cfg(feature = "desktop-acceptance")]
+    let acceptance = desktop_acceptance::Run::from_env(native.as_ref())?;
+    #[cfg(feature = "desktop-acceptance")]
+    let (paint_observer, paint_window) = (acceptance.clone(), ui.as_weak());
+    let rendering_notifier = ui.window().set_rendering_notifier(move |state, _| {
         if matches!(state, slint::RenderingState::AfterRendering) {
-            if let Some(edited) = render_time.lock().unwrap().take() {
+            if let Some((generation, edited)) = render_time.lock().unwrap().take() {
                 debug!(
+                    generation,
                     elapsed_us = edited.elapsed().as_micros(),
                     "First search page painted"
                 );
             }
+            #[cfg(feature = "desktop-acceptance")]
+            if let (Some(observer), Some(ui)) = (&paint_observer, paint_window.upgrade()) {
+                observer.after_rendering(&ui);
+            }
         }
-    }) {
+    });
+    let paint_supported = rendering_notifier.is_ok();
+    if let Err(err) = rendering_notifier {
+        #[cfg(feature = "desktop-acceptance")]
+        if acceptance.is_some() {
+            return Err(VelocityError::Config(format!(
+                "Desktop acceptance requires a renderer with paint notifications: {err:?}"
+            )));
+        }
         debug!(?err, "First-paint timing unavailable with this renderer");
     }
+    let refresh_paint = first_paint.clone();
     ui.on_search_requested(move |text| {
         let Some(ui) = weak.upgrade() else { return };
         let edited = Instant::now();
+        let generation = ui.get_search_generation().wrapping_add(1);
+        ui.set_search_generation(generation);
         *first_paint.lock().unwrap() = None;
         let mut state = callback_state.lock().unwrap();
         if let Some(job) = state.pending.take() {
@@ -320,10 +343,6 @@ fn main() -> VelocityResult<()> {
         let provider = search_provider.clone();
         let weak = weak.clone();
 
-        // A result can already be queued when its task is aborted. Validate its
-        // generation on the event thread before publishing the result.
-        let generation = ui.get_search_generation().wrapping_add(1);
-        ui.set_search_generation(generation);
         let result_state = callback_state.clone();
         let first_paint = first_paint.clone();
         state.pending = Some(handle.spawn(async move {
@@ -331,21 +350,22 @@ fn main() -> VelocityResult<()> {
             let outcome = provider.search(query).await;
             let _ = slint::invoke_from_event_loop(move || {
                 let Some(ui) = weak.upgrade() else { return };
+                // Aborting the task cannot retract a completion already queued on the UI thread.
                 if ui.get_search_generation() != generation || !ui.get_searching() {
                     return;
                 }
                 ui.set_status_text("".into());
-                if outcome
-                    .as_ref()
-                    .is_ok_and(|results| !results.results.is_empty())
-                {
-                    *first_paint.lock().unwrap() = Some(edited);
+                receive_page(&ui, &mut result_state.lock().unwrap(), outcome);
+                if ui.get_search_results().row_count() > 0 {
+                    if paint_supported && ui.window().is_visible() {
+                        *first_paint.lock().unwrap() = Some((generation, edited));
+                    }
                     debug!(
+                        generation,
                         elapsed_us = edited.elapsed().as_micros(),
                         "First search page delivered to UI"
                     );
                 }
-                receive_page(&ui, &mut result_state.lock().unwrap(), outcome);
             });
         }));
     });
@@ -369,7 +389,14 @@ fn main() -> VelocityResult<()> {
                 ui.set_index_needs_retry(status.roots.iter().any(|root| {
                     matches!(root.state, RootState::AccessDenied | RootState::Unavailable)
                 }));
-                if revision.replace(status.revision) != status.revision {
+                // Give the user's query a chance to paint before refreshing it for a new snapshot.
+                let awaiting_paint = ui.window().is_visible()
+                    && refresh_paint
+                        .lock()
+                        .unwrap()
+                        .is_some_and(|(_, edited)| edited.elapsed() < Duration::from_secs(1));
+                if revision.get() != status.revision && !ui.get_searching() && !awaiting_paint {
+                    revision.set(status.revision);
                     ui.invoke_refresh_search();
                 }
             },
@@ -572,8 +599,16 @@ fn main() -> VelocityResult<()> {
 
     info!("Starting Velocity Search");
     ui.show()?;
+    #[cfg(feature = "desktop-acceptance")]
+    let acceptance_job = acceptance.map(|run| run.start(&ui, &runtime));
     slint::run_event_loop_until_quit()?;
     runtime.block_on(provider.shutdown())?;
+    #[cfg(feature = "desktop-acceptance")]
+    if let Some(job) = acceptance_job {
+        runtime
+            .block_on(job)
+            .map_err(|err| VelocityError::IndexProvider(err.to_string()))??;
+    }
     runtime.shutdown_background();
     Ok(())
 }

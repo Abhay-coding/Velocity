@@ -15,7 +15,7 @@ The baseline UI asks for at least two characters and debounces edits by 150 ms. 
 | M1 · Reference results | The self-test printed the exact intentionally missing and duplicate paths. The installed Everything CLI returned `IPC unavailable`, so there is no legacy comparison for this host. |
 | M2 · Folder search | The Windows manifest matched the complete native result set and all six queries, including the long path, both hard links, and excluded and junction subtrees. A desktop test selected the second of two identical Unicode filenames by keyboard. Its distinctive Beta contents appeared in Notepad. |
 | M3 · Queries and pages | Tests cover AND terms, quotes, case-insensitive names, paths, `ext:`, invalid operators, count-only mode, adjacent pages, and an out-of-range offset. Ordering is by the folded name, folded full path, original parent path, and original name. Exact totals cover the published scope. The Files and Folders controls filter the displayed page. |
-| M4 · Typing path | Native search reads only the snapshot. A provider test renamed a file while indexing was paused and confirmed the old name remained searchable with unknown size and modification time. The desktop rapid-edit smoke ended with only the rare result. First-page and renderer-supported first-paint timings are logged. A measured rapid-edit run during a rebuild remains open. |
+| M4 · Typing path | Native search reads only the snapshot. A provider test renamed a file while indexing was paused and still found the indexed name with unknown metadata. The desktop acceptance run verified that the narrow result painted during a rebuild and that obsolete results never painted after the narrow edit. See the M4 procedure and measurements below. |
 | M5 · Scope and access | Tests covered overlapping roots, exclusions, a separate healthy root, and live Windows ACL revocation and recovery. While the permission was denied, the subtree stayed out of results and counts. The provider records a volume GUID and serial when Windows supplies them. A run under a second Windows account remains open. |
 | M6 · NTFS snapshot | The experimental reader captures the volume GUID, journal ID and start USN, follows the enumeration cursor, and preserves full record and parent IDs plus UTF-16 names. Unit tests check record bounds and IDs. User-visible hard-link reconciliation and the two-volume Windows acceptance run remain open. |
 | M7 · NTFS journal | Synthetic replay tests cover rename pairs, descendant paths after directory moves, file-ID reuse, repeated batches, and hard-link and ACL reconciliation flags. The live journal loop and its user-visible projection remain open. |
@@ -38,6 +38,20 @@ The x64 ZIP was built with Rust 1.97.1 from the working tree based on `b6ed6f4`.
 Release decision remains pending. The development package is usable for folder search. Raw NTFS indexing, persistence and clean-VM release acceptance remain open.
 
 The locked workspace suite passed 30 tests. Both opt-in Windows tests for the junction fixture and live ACL changes passed separately. The raw volume test remains gated on a disposable NTFS volume. Clippy passed with warnings denied for `velocity-native` and `velocity-ui`.
+
+## M4 desktop acceptance
+
+Run on a Windows desktop session with a local writable workspace.
+
+```powershell
+pwsh -NoProfile -File tools/typing-during-rebuild.ps1
+```
+
+The script builds Velocity in release mode with the opt-in `desktop-acceptance` feature, creates a disposable 200,000-file corpus, and launches the app with the FemtoVG renderer. The test types `report` and narrows it to `report-needle` after 35 ms while a native rebuild scans the same root. It checks every rendered frame after the narrow edit until the refreshed query settles. A trial fails if an obsolete result paints, metadata loads before the first page, or the narrow page first paints outside the rebuild window. The output reports each trial's first-paint latency and the nearest-rank p50 and p95. Adjust `-Entries` if the rebuild on your machine finishes before the first frame, and use `-Trials` to adjust the sample count.
+
+On 21 November 2026, all 10 trials passed on the Windows reference host described below. First paint took **168.75 ms p50** and **188.92 ms p95**, including the 150 ms debounce. The expected filename painted during every rebuild and repainted after publication. The observer counted zero stale frames, the first rows showed unknown metadata, and all 21 provider page events reported zero filesystem reads in the search path. The workspace suite passed 30 tests, and Clippy passed with warnings denied for the desktop acceptance build.
+
+First-paint samples in trial order, in milliseconds: 188.916, 166.173, 167.817, 168.582, 169.777, 169.348, 168.750, 168.695, 170.306, 172.327.
 
 ## Release benchmark
 
@@ -69,6 +83,6 @@ Reference host used on 20 November 2026, India time. Windows 26H2 build `26300.9
 | Peak working set through initial build | 40.6 MiB | 351.4 MiB |
 | Private bytes after initial build | 38.4 MiB | 358.9 MiB |
 
-All six provider query classes met the 50 ms p95 target at one million entries. The sampled ordinary file changes met the 1 second target. Both full-corpus comparisons found zero missing, stale, duplicate or out-of-scope paths after catch-up. The initial runs that rescanned whole roots after every notification took several seconds to show file changes at one million entries. The final run uses bounded file updates and falls back to a scoped walk for directory or access changes. Desktop first-paint percentiles, privileged NTFS timings, persisted snapshot size and load time, and an Everything timing comparison remain open.
+All six provider query classes met the 50 ms p95 target at one million entries. The sampled ordinary file changes met the 1 second target. Both full-corpus comparisons found zero missing, stale, duplicate or out-of-scope paths after catch-up. The initial runs that rescanned whole roots after every notification took several seconds to show file changes at one million entries. The final run uses bounded file updates and falls back to a scoped walk for directory or access changes. The full desktop first-paint benchmark at the release corpus sizes, privileged NTFS timings, persisted snapshot size and load time, and an Everything timing comparison remain open.
 
 [Raw 100,000-entry measurements](benchmarks/2026-11-20-folder-100000.txt) · [Raw 1,000,000-entry measurements](benchmarks/2026-11-20-folder-1000000.txt)

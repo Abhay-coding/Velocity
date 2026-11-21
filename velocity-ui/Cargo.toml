@@ -5,6 +5,7 @@ edition = "2021"
 
 [features]
 everything = ["dep:velocity-everything"]
+desktop-acceptance = []
 
 [dependencies]
 velocity-core = { path = "../velocity-core" }
