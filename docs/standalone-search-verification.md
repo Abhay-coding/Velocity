@@ -16,7 +16,7 @@ The baseline UI asks for at least two characters and debounces edits by 150 ms. 
 | M2 · Folder search | The Windows manifest matched the complete native result set and all six queries, including the long path, both hard links, and excluded and junction subtrees. A desktop test selected the second of two identical Unicode filenames by keyboard. Its distinctive Beta contents appeared in Notepad. |
 | M3 · Queries and pages | Tests cover AND terms, quotes, case-insensitive names, paths, `ext:`, invalid operators, count-only mode, adjacent pages, and an out-of-range offset. Ordering is by the folded name, folded full path, original parent path, and original name. Exact totals cover the published scope. The Files and Folders controls filter the displayed page. |
 | M4 · Typing path | Native search reads only the snapshot. A provider test renamed a file while indexing was paused and still found the indexed name with unknown metadata. The desktop acceptance run verified that the narrow result painted during a rebuild and that obsolete results never painted after the narrow edit. See the M4 procedure and measurements below. |
-| M5 · Scope and access | Tests covered overlapping roots, exclusions, a separate healthy root, and live Windows ACL revocation and recovery. While the permission was denied, the subtree stayed out of results and counts. The provider records a volume GUID and serial when Windows supplies them. A run under a second Windows account remains open. |
+| M5 · Scope and access | The Windows acceptance run passed under two distinct account SIDs. The restricted subtree stayed out of the standard observer's results and counts, and the independent root remained searchable. Tests also cover overlapping roots, exclusions, stable NTFS volume identity, and live ACL revocation and recovery. |
 | M6 · NTFS snapshot | The experimental reader captures the volume GUID, journal ID and start USN, follows the enumeration cursor, and preserves full record and parent IDs plus UTF-16 names. Unit tests check record bounds and IDs. User-visible hard-link reconciliation and the two-volume Windows acceptance run remain open. |
 | M7 · NTFS journal | Synthetic replay tests cover rename pairs, descendant paths after directory moves, file-ID reuse, repeated batches, and hard-link and ACL reconciliation flags. The live journal loop and its user-visible projection remain open. |
 | M8 · Folder changes | `ReadDirectoryChangesW` starts before the initial walk. Small file batches update affected entries. Overflow, directory moves, access changes and reconnects use a scoped walk. Tests force a real notification-buffer overflow and exercise renames, moves, hard-link removal, and a simulated root disconnect and reconnect while another root remains searchable. Removable or network media acceptance remains open. [Microsoft directory notification documentation](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-readdirectorychangesw) |
@@ -52,6 +52,19 @@ The script builds Velocity in release mode with the opt-in `desktop-acceptance` 
 On 21 November 2026, all 10 trials passed on the Windows reference host described below. First paint took **168.75 ms p50** and **188.92 ms p95**, including the 150 ms debounce. The expected filename painted during every rebuild and repainted after publication. The observer counted zero stale frames, the first rows showed unknown metadata, and all 21 provider page events reported zero filesystem reads in the search path. The workspace suite passed 30 tests, and Clippy passed with warnings denied for the desktop acceptance build.
 
 First-paint samples in trial order, in milliseconds: 188.916, 166.173, 167.817, 168.582, 169.777, 169.348, 168.750, 168.695, 170.306, 172.327.
+
+## M5 Windows account scope
+
+Run this from a local NTFS checkout. Use an existing standard Windows test account with local sign-in rights. Enter its credentials in the local PowerShell prompt. [Microsoft secondary sign-in documentation](https://learn.microsoft.com/windows/win32/api/winbase/nf-winbase-createprocesswithlogonw)
+
+```powershell
+$observer = Get-Credential -UserName "$env:COMPUTERNAME\VelocityObserver" -Message 'Enter the existing Windows test account credentials'
+./tools/verify-user-scope.ps1 -ObserverCredential $observer
+```
+
+Use the name of your existing test account in place of `VelocityObserver`. The runner probes the same fixture first as the owner and then as the observer. It verifies the SID and completion receipt for each process. The observer has read and execute access within the disposable fixture, a deny rule on the restricted subtree, and write access to the receipt. Cleanup removes the temporary fixture and its ACLs. The probe compares exact paths and types, paged and count-only totals, coverage for redundant, excluded, unavailable and denied roots, and the shared NTFS volume identity. [Microsoft ACL command documentation](https://learn.microsoft.com/windows-server/administration/windows-commands/icacls)
+
+On 22 November 2026, the same-account harness and the two-account acceptance run both passed on the local NTFS workspace. The owner probe returned five entries and four `budget` matches. The observer probe ran under a distinct standard Windows account SID, returned three entries and two `budget` matches, and found zero matches for the restricted file. Both probes matched their complete expected path and type sets. The observer could still search the separate healthy root. Cleanup verified removal of the temporary fixture, account, and Windows profile.
 
 ## Release benchmark
 
