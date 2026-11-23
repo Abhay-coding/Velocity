@@ -19,6 +19,7 @@ pub struct Config {
 pub struct SearchConfig {
     pub backend: SearchBackend,
     pub roots: Vec<PathBuf>,
+    pub ntfs_snapshots: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]

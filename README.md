@@ -49,6 +49,8 @@ Put `config.toml` beside `velocity-ui.exe`. Add absolute folders under `search.r
 
 **Pause** keeps the previous snapshot searchable. **Resume** and **Reindex** scan the configured roots again. Searches use the last published snapshot during a rebuild. The current folder index rebuilds from disk at launch.
 
+Set `search.ntfs_snapshots = true` to use NTFS snapshots for whole local drives such as `D:\`. Velocity checks directory access under the running account before adding names to search, including additional hard-link names. When the account cannot read the volume or its change journal, Velocity uses folder indexing automatically. Folder indexing remains the default.
+
 ### Everything comparison
 
 For a comparison build, run `cargo build --release --locked -p velocity-ui --features everything` and set `search.backend = 'everything'` in `config.toml`. Start Everything and put `es.exe` beside the executable or on `PATH`, or set `VELOCITY_ES_PATH` to its full path.
@@ -66,7 +68,7 @@ cargo run --locked -p velocity-ui
 | [velocity-ui](velocity-ui) | Slint interface, keyboard navigation, tray, and Windows file opening |
 | [velocity-everything](velocity-everything) | Process adapter for the Everything CLI |
 | [velocity-core](velocity-core) | Provider interface, data types, and configuration |
-| [velocity-native](velocity-native) | Native folder index, query engine, Windows change notifications, and NTFS journal experiments |
+| [velocity-native](velocity-native) | Native folder index, scoped NTFS snapshots, query engine, and Windows change notifications |
 | [velocity-mft](velocity-mft) | Experimental NTFS parser and synthetic record tests |
 
 See [standalone search verification](docs/standalone-search-verification.md) for the fixture, tested behavior and release gates.

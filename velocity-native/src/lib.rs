@@ -30,7 +30,7 @@ use folder::Exclusions;
 use monitor::Pending;
 use query::Term;
 
-#[derive(PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 struct Entry {
     parent: Arc<Path>,
     name: OsString,
@@ -75,6 +75,8 @@ pub struct RootCoverage {
     pub examples: Vec<(PathBuf, String)>,
     pub detail: Option<String>,
     pub volume: Option<Volume>,
+    #[cfg(windows)]
+    pub ntfs: Option<Arc<ntfs::ScopedSnapshot>>,
     canonical: Option<PathBuf>,
 }
 
@@ -96,6 +98,8 @@ impl RootCoverage {
             examples: Vec::new(),
             detail: None,
             volume: None,
+            #[cfg(windows)]
+            ntfs: None,
             canonical: None,
         }
     }
@@ -136,6 +140,7 @@ pub struct FolderProvider {
     pause_epoch: Arc<AtomicU64>,
     rebuild: Arc<tokio::sync::Mutex<()>>,
     stopped: tokio::sync::Notify,
+    ntfs_batch_bytes: Option<usize>,
 }
 
 impl FolderProvider {
@@ -176,7 +181,16 @@ impl FolderProvider {
             pause_epoch: Arc::default(),
             rebuild: Arc::default(),
             stopped: tokio::sync::Notify::new(),
+            ntfs_batch_bytes: None,
         })
+    }
+
+    /// Request NTFS snapshots for configured volume roots. Folder indexing
+    /// remains available when the current Windows token cannot open a volume.
+    #[cfg(windows)]
+    pub fn with_ntfs_snapshots(mut self, batch_bytes: usize) -> Self {
+        self.ntfs_batch_bytes = Some(batch_bytes);
+        self
     }
 
     pub fn status(&self) -> NativeStatus {
@@ -200,6 +214,7 @@ impl FolderProvider {
             self.pause_epoch.clone(),
         );
         let starting_epoch = epoch.load(Ordering::Acquire);
+        let ntfs_batch_bytes = self.ntfs_batch_bytes;
         tokio::task::spawn_blocking(move || {
             let _guard = guard;
             let cancelled =
@@ -229,11 +244,15 @@ impl FolderProvider {
                         continue;
                     }
                     if let Pending::Paths(paths) = &dirty[index] {
+                        #[cfg(windows)]
+                        let folder_source = coverage[index].ntfs.is_none();
+                        #[cfg(not(windows))]
+                        let folder_source = true;
                         let independent = roots.len() == 1 || roots.iter().enumerate().all(|(other_index, other)| {
                             index == other_index || (!root.starts_with(other) && !other.starts_with(root)
                                 && coverage[other_index].state != RootState::Skipped)
                         });
-                        if independent && coverage[index].state == RootState::Ready && coverage[index].skipped == 0 {
+                        if folder_source && independent && coverage[index].state == RootState::Ready && coverage[index].skipped == 0 {
                             if let Some(found) = folder::reconcile_files(root, &exclusions, &by_root[index], paths, cancelled) {
                                 if let Some(path) = &coverage[index].canonical { visited.insert(path.clone()); }
                                 coverage[index].entries = found.len() as u64;
@@ -255,6 +274,7 @@ impl FolderProvider {
                     &exclusions,
                     &mut visited,
                     &mut found,
+                    ntfs_batch_bytes,
                     cancelled,
                     |count| {
                         state.write().unwrap().status.roots[index].entries = count;
@@ -299,7 +319,6 @@ impl FolderProvider {
             });
             if dirty.is_none() || changed || coverage_changed {
                 info!(
-                    source = "folder",
                     entries = state.entries.len(),
                     elapsed_ms = started.elapsed().as_millis(),
                     "Published search snapshot"

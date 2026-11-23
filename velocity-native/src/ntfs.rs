@@ -15,7 +15,7 @@ use windows_sys::Win32::{
     Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY,
     System::{
         Ioctl::{
-            FSCTL_ENUM_USN_DATA, FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_USN_JOURNAL, MFT_ENUM_DATA_V1,
+            FSCTL_ENUM_USN_DATA, FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_USN_JOURNAL, MFT_ENUM_DATA_V0,
             READ_USN_JOURNAL_DATA_V1, USN_JOURNAL_DATA_V0, USN_REASON_FILE_DELETE,
             USN_REASON_HARD_LINK_CHANGE, USN_REASON_RENAME_OLD_NAME, USN_REASON_SECURITY_CHANGE,
         },
@@ -27,6 +27,12 @@ use crate::{
     windows::{self, Handle},
     Volume,
 };
+
+mod snapshot;
+pub(crate) use snapshot::capture;
+pub use snapshot::ScopedSnapshot;
+
+pub const DEFAULT_BATCH_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Record {
@@ -121,7 +127,12 @@ impl Reader {
     pub fn open(mount: &Path) -> io::Result<Self> {
         let volume = windows::volume(mount)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "volume is unavailable"))?;
-        if volume.mount != mount || !volume.filesystem.eq_ignore_ascii_case("NTFS") {
+        if !volume
+            .mount
+            .as_os_str()
+            .eq_ignore_ascii_case(mount.as_os_str())
+            || !volume.filesystem.eq_ignore_ascii_case("NTFS")
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "supply the root of a local NTFS volume",
@@ -151,12 +162,10 @@ impl Reader {
         mut accept: impl FnMut(Record) -> io::Result<()>,
     ) -> io::Result<(Checkpoint, usize)> {
         let checkpoint = self.checkpoint()?;
-        let mut input = MFT_ENUM_DATA_V1 {
+        let mut input = MFT_ENUM_DATA_V0 {
             StartFileReferenceNumber: 0,
             LowUsn: 0,
             HighUsn: i64::MAX,
-            MinMajorVersion: 2,
-            MaxMajorVersion: 2,
         };
         let mut batches = 0;
         let mut output = batch_buffer(buffer_bytes)?;

@@ -147,6 +147,11 @@ fn coverage_text(status: &NativeStatus) -> String {
             RootState::Skipped => "excluded, nested or a reparse point".into(),
         };
         text.push_str(&format!("\n{} · {label}", root.root.display()));
+        if root.ntfs.is_some() {
+            text.push_str(" · NTFS snapshot");
+        } else if root.state == RootState::Ready && root.detail.is_some() {
+            text.push_str(" · Folder fallback");
+        }
         if root.skipped > 0 {
             text.push_str(&format!(" · {} skipped", root.skipped));
             if let Some((path, reason)) = root.examples.first() {
@@ -228,14 +233,19 @@ fn main() -> VelocityResult<()> {
                         .map(|drive| PathBuf::from(format!("{drive}\\"))),
                 );
             }
-            let native = Arc::new(FolderProvider::new(
+            let native = FolderProvider::new(
                 roots,
                 if config.excludes.enabled {
                     &config.excludes.patterns
                 } else {
                     &[]
                 },
-            )?);
+            )?;
+            let native = Arc::new(if config.search.ntfs_snapshots {
+                native.with_ntfs_snapshots(velocity_native::ntfs::DEFAULT_BATCH_BYTES)
+            } else {
+                native
+            });
             (native.clone(), Some(native))
         }
     };

@@ -22,7 +22,7 @@ impl Exclusions {
             .map(Self)
     }
 
-    fn matches(&self, path: &Path, is_directory: bool) -> bool {
+    pub(crate) fn matches(&self, path: &Path, is_directory: bool) -> bool {
         let normalized = path.to_string_lossy().replace('\\', "/");
         let options = MatchOptions {
             case_sensitive: false,
@@ -60,7 +60,7 @@ fn skip_entry(file_type: FileType, path: &Path) -> bool {
             && fs::symlink_metadata(path).map_or(true, |metadata| is_reparse_point(&metadata)))
 }
 
-fn make_entry(parent: &Arc<Path>, name: OsString, is_directory: bool) -> Arc<Entry> {
+pub(crate) fn make_entry(parent: &Arc<Path>, name: OsString, is_directory: bool) -> Arc<Entry> {
     let name_key = name.to_string_lossy().to_lowercase();
     let path_key = path_key(&parent.join(&name));
     Arc::new(Entry {
@@ -158,6 +158,7 @@ pub(crate) fn scan(
     exclusions: &Exclusions,
     visited: &mut HashSet<PathBuf>,
     entries: &mut Vec<Arc<Entry>>,
+    #[cfg_attr(not(windows), allow(unused_variables))] ntfs_batch_bytes: Option<usize>,
     cancelled: impl Fn() -> bool,
     mut progress: impl FnMut(u64),
 ) -> RootCoverage {
@@ -184,6 +185,41 @@ pub(crate) fn scan(
     #[cfg(windows)]
     {
         coverage.volume = crate::windows::volume(&root);
+        if let Some(batch_bytes) = ntfs_batch_bytes.filter(|_| {
+            coverage.volume.as_ref().is_some_and(|volume| {
+                volume
+                    .mount
+                    .as_os_str()
+                    .eq_ignore_ascii_case(root.as_os_str())
+                    && volume.filesystem.eq_ignore_ascii_case("NTFS")
+            })
+        }) {
+            let mut projected = coverage.clone();
+            let canonical = coverage.canonical.as_deref().unwrap();
+            match crate::ntfs::capture(
+                &root,
+                canonical,
+                exclusions,
+                &mut projected,
+                batch_bytes,
+                &cancelled,
+                &mut progress,
+            ) {
+                Ok(snapshot) => {
+                    tracing::info!(root = %root.display(), entries = projected.entries, batches = snapshot.enumeration_batches,
+                        aliases = snapshot.hard_link_aliases, source = "ntfs", "Built scoped NTFS snapshot");
+                    entries.extend(snapshot.entries());
+                    projected.ntfs = Some(Arc::new(snapshot));
+                    return projected;
+                }
+                Err(_) if cancelled() => return coverage,
+                Err(error) => {
+                    tracing::debug!(root = %root.display(), %error, "Using folder indexing for NTFS root");
+                    coverage.detail = Some(error.to_string());
+                    progress(0);
+                }
+            }
+        }
     }
     let mut pending = vec![(Arc::<Path>::from(root), root_entries)];
     while let Some((parent, children)) = pending.pop() {
