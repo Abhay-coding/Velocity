@@ -610,7 +610,9 @@ fn main() -> VelocityResult<()> {
     info!("Starting Velocity Search");
     ui.show()?;
     #[cfg(feature = "desktop-acceptance")]
-    let acceptance_job = acceptance.map(|run| run.start(&ui, &runtime));
+    let acceptance_job = acceptance
+        .map(|run| run.start(&ui, &runtime))
+        .or_else(|| desktop_acceptance::start_ntfs(&ui, &runtime));
     slint::run_event_loop_until_quit()?;
     runtime.block_on(provider.shutdown())?;
     #[cfg(feature = "desktop-acceptance")]

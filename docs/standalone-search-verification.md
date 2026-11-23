@@ -18,7 +18,7 @@ The baseline UI asks for at least two characters and debounces edits by 150 ms. 
 | M4 · Typing path | Native search reads only the snapshot. A provider test renamed a file while indexing was paused and still found the indexed name with unknown metadata. The desktop acceptance run verified that the narrow result painted during a rebuild and that obsolete results never painted after the narrow edit. See the M4 procedure and measurements below. |
 | M5 · Scope and access | The Windows acceptance run passed under two distinct account SIDs. The restricted subtree stayed out of the standard observer's results and counts, and the independent root remained searchable. Tests also cover overlapping roots, exclusions, stable NTFS volume identity, and live ACL revocation and recovery. |
 | M6 · NTFS snapshot | Two disposable NTFS volumes passed the exact path and type comparison against independent walks. The opt-in reader captured each volume GUID, journal ID and starting USN before enumeration. It reconciled both hard-link names under the running account's access rules. A forced reader failure returned the same scoped results through folder indexing. |
-| M7 · NTFS journal | Synthetic replay tests cover rename pairs, descendant paths after directory moves, file-ID reuse, repeated batches, and hard-link and ACL reconciliation flags. The live journal loop and its user-visible projection remain open. |
+| M7 · NTFS journal | Replay catches up from the initial scan position and tails the journal while search is open. The Windows acceptance suite compares live changes with independent walks and checks that the open desktop query refreshes after directory and file renames. |
 | M8 · Folder changes | `ReadDirectoryChangesW` starts before the initial walk. Small file batches update affected entries. Overflow, directory moves, access changes and reconnects use a scoped walk. Tests force a real notification-buffer overflow and exercise renames, moves, hard-link removal, and a simulated root disconnect and reconnect while another root remains searchable. Removable or network media acceptance remains open. [Microsoft directory notification documentation](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-readdirectorychangesw) |
 | M9 · Persistence | Checkpoint validation rejects a mismatched volume, a changed journal ID and out-of-range USNs. Atomic disk snapshots and interrupted-save recovery remain open. Folder mode scans current files at startup. |
 | M10 · Desktop controls | The desktop smoke opened the correct Unicode file and observed the active query refresh and an unavailable root becoming ready. Provider tests cover pause, resume, and monitor shutdown. The full keyboard, tray, hotkey and Retry acceptance run remains open. |
@@ -33,7 +33,7 @@ Run the locked workspace tests and the optional desktop build check with `cargo 
 
 The x64 ZIP was built with Rust 1.97.1 from the working tree based on `b6ed6f4`. It contains `velocity-ui.exe` and `config.example.toml`. SHA-256 `97C012B4F42E18B63652FBD74AD4ACA45B9C127C75332B31DC2A90F7FE360DB2`. The default desktop dependency graph contains `velocity-native` and omits both the Everything adapter and experimental MFT parser. The optional Everything build passed its type check. The candidate links the MSVC runtime statically, and the executable import list contains only Windows system libraries. [Microsoft C++ deployment options](https://learn.microsoft.com/en-us/cpp/windows/deployment-in-visual-cpp)
 
-Release decision remains pending. The development package is usable for folder search. Live NTFS journal replay, persistence and clean-VM release acceptance remain open.
+Release decision remains pending. The development package is usable for folder search. Persistence and clean-VM release acceptance remain open.
 
 The locked workspace suite passed 30 tests. The opt-in Windows tests for the junction fixture, live ACL changes and two-volume NTFS snapshot passed separately. Clippy passed with warnings denied for `velocity-native` and `velocity-ui`.
 
@@ -73,6 +73,20 @@ Run from the repository root in an elevated Windows PowerShell. The script creat
 ```
 
 On 23 November 2026, each volume returned 86 entries across 16 enumeration batches and matched the independent walk exactly. Both hard-link names shared a file reference and had distinct parent references. Identical relative paths stayed searchable on both volume identities. Denied, excluded and junction paths stayed outside the results and counts. Folder fallback matched the same walks after a forced snapshot failure. [Microsoft enumeration cursor documentation](https://learn.microsoft.com/en-us/windows/win32/api/winioctl/ns-winioctl-mft_enum_data_v0)
+
+## M7 live NTFS acceptance
+
+Run from the repository root in an elevated Windows PowerShell session on an interactive desktop. The runner uses the disposable M6 volumes. [Microsoft change journal read documentation](https://learn.microsoft.com/en-us/windows/win32/api/winioctl/ni-winioctl-fsctl_read_usn_journal)
+
+```powershell
+./tools/verify-ntfs-snapshot.ps1 -Journal -Desktop
+```
+
+The startup test renames a file during the initial scan. It then reads again from the same checkpoint twice and compares the resulting projections and cursors. The live test checks exact paths, types and counts after removing one hard link, replacing a file at the same path, moving a file between directories, renaming a directory with matching descendants, and revoking and restoring directory listing access. It also verifies that content-only changes advance the journal position without refreshing the result list. The desktop test keeps one query open and waits for the old path to disappear and the new path to appear after each rename.
+
+On 23 November 2026, the snapshot, startup replay, live journal and desktop checks passed. The active query painted the initial result and refreshed after both renames. Both virtual disks were detached and deleted after the run. The locked workspace suite passed all 30 regular tests, and Clippy passed with warnings denied, including the desktop acceptance build.
+
+Ordinary file events refresh the affected directories where possible. Directory moves, hard links, permission changes and ambiguous batches can require a fresh scoped directory walk. The journal cursor and searchable entries publish together. NTFS replay throughput is still part of M11.
 
 ## Release benchmark
 

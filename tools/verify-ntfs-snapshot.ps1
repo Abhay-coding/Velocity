@@ -1,3 +1,5 @@
+param([switch]$Journal, [switch]$Desktop)
+
 $ErrorActionPreference = 'Stop'
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = [Security.Principal.WindowsPrincipal]::new($identity)
@@ -53,6 +55,47 @@ function New-TestCorpus([string]$Root, [string]$Trustee) {
     if ($LASTEXITCODE) { throw 'Could not deny enumeration of the restricted test directory.' }
 }
 
+function Test-DesktopJournal([string]$Root, [string]$Stage) {
+    cargo build --locked -p velocity-ui --features desktop-acceptance
+    if ($LASTEXITCODE) { throw "Desktop acceptance build exited with code $LASTEXITCODE." }
+    $fixture = Join-Path $Root 'desktop-fixture'
+    $before = Join-Path $fixture 'before'
+    $null = [IO.Directory]::CreateDirectory($before)
+    [IO.File]::WriteAllText((Join-Path $before 'desktop-journal-old.txt'), 'Synthetic desktop fixture')
+    Copy-Item -LiteralPath target/debug/velocity-ui.exe -Destination $Stage
+    @('[search]', "roots = ['$Root']", 'ntfs_snapshots = true') |
+        Set-Content -LiteralPath (Join-Path $Stage 'config.toml') -Encoding Ascii
+    $previousFixture = $env:VELOCITY_NTFS_DESKTOP_FIXTURE
+    $previousRenderer = $env:SLINT_BACKEND
+    try {
+        $env:VELOCITY_NTFS_DESKTOP_FIXTURE = $fixture
+        $env:SLINT_BACKEND = 'winit-femtovg'
+        $launch = [Diagnostics.ProcessStartInfo]::new((Join-Path $Stage 'velocity-ui.exe'))
+        $launch.WorkingDirectory = $Stage
+        $launch.UseShellExecute = $false
+        $launch.RedirectStandardOutput = $true
+        $launch.RedirectStandardError = $true
+        $process = [Diagnostics.Process]::Start($launch)
+        try {
+            $output = $process.StandardOutput.ReadToEndAsync()
+            $errors = $process.StandardError.ReadToEndAsync()
+            if (!$process.WaitForExit(90000)) {
+                $process.Kill()
+                $process.WaitForExit()
+                throw 'Desktop acceptance timed out.'
+            }
+            $output.GetAwaiter().GetResult()
+            $errors.GetAwaiter().GetResult()
+            if ($process.ExitCode -ne 0) { throw "Desktop acceptance exited with code $($process.ExitCode)." }
+        } finally {
+            $process.Dispose()
+        }
+    } finally {
+        $env:VELOCITY_NTFS_DESKTOP_FIXTURE = $previousFixture
+        $env:SLINT_BACKEND = $previousRenderer
+    }
+}
+
 $repo = Split-Path -Parent $PSScriptRoot
 Push-Location -LiteralPath $repo
 try {
@@ -63,16 +106,26 @@ try {
     $images = @((Join-Path $stage 'scope-a.vhd'), (Join-Path $stage 'scope-b.vhd'))
     $previousA = $env:VELOCITY_NTFS_VOLUME_A
     $previousB = $env:VELOCITY_NTFS_VOLUME_B
+    $previousTrustee = $env:VELOCITY_NTFS_TRUSTEE
     try {
         $roots = @((New-TestVolume $images[0] 'VelocityM6A' $stage), (New-TestVolume $images[1] 'VelocityM6B' $stage))
         foreach ($root in $roots) { New-TestCorpus $root ('*' + $identity.User.Value) }
         $env:VELOCITY_NTFS_VOLUME_A = $roots[0]
         $env:VELOCITY_NTFS_VOLUME_B = $roots[1]
-        cargo test --locked -p velocity-native --test ntfs_snapshot -- --ignored --nocapture
+        cargo test --locked -p velocity-native --test ntfs_snapshot scoped_ntfs_snapshots_match_independent_walks -- --ignored --nocapture
         if ($LASTEXITCODE) { throw "NTFS acceptance exited with code $LASTEXITCODE." }
+        if ($Journal) {
+            $env:VELOCITY_NTFS_TRUSTEE = '*' + $identity.User.Value
+            cargo test --locked -p velocity-native --test ntfs_snapshot tails_ntfs_journal_and_matches_a_fresh_walk -- --ignored --nocapture
+            if ($LASTEXITCODE) { throw "NTFS journal acceptance exited with code $LASTEXITCODE." }
+            cargo test --locked -p velocity-native --lib catches_changes_during_projection_and_replays_idempotently -- --ignored --nocapture
+            if ($LASTEXITCODE) { throw "NTFS catch-up acceptance exited with code $LASTEXITCODE." }
+        }
+        if ($Desktop) { Test-DesktopJournal $roots[1] $stage }
     } finally {
         $env:VELOCITY_NTFS_VOLUME_A = $previousA
         $env:VELOCITY_NTFS_VOLUME_B = $previousB
+        $env:VELOCITY_NTFS_TRUSTEE = $previousTrustee
         foreach ($image in $images) {
             if (Test-Path -LiteralPath $image) {
                 $mounted = Get-DiskImage -ImagePath $image -ErrorAction SilentlyContinue

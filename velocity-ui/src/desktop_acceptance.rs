@@ -1,4 +1,6 @@
 use std::{
+    fs,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -30,6 +32,86 @@ struct Observation {
     first_frame: Option<(Duration, bool, bool)>,
     painted_generation: Option<i32>,
     stale_frames: usize,
+}
+
+pub(crate) fn start_ntfs(
+    ui: &SearchBar,
+    runtime: &Runtime,
+) -> Option<JoinHandle<VelocityResult<()>>> {
+    let root = PathBuf::from(std::env::var_os("VELOCITY_NTFS_DESKTOP_FIXTURE")?);
+    let weak = ui.as_weak();
+    Some(runtime.spawn(async move {
+        let result = verify_ntfs(&weak, &root).await;
+        let _ = slint::invoke_from_event_loop(|| {
+            let _ = slint::quit_event_loop();
+        });
+        result
+    }))
+}
+
+async fn verify_ntfs(ui: &Weak<SearchBar>, root: &Path) -> VelocityResult<()> {
+    let before = root.join("before");
+    let after = root.join("after");
+    let old = before.join("desktop-journal-old.txt");
+    timeout(Duration::from_secs(20), async {
+        while !on_ui(ui, |ui| ui.get_coverage().contains("NTFS snapshot")).await? {
+            sleep(Duration::from_millis(20)).await;
+        }
+        on_ui(ui, |ui| {
+            ui.invoke_focus_search();
+            for ch in "desktop-journal".chars() {
+                key(&ui, ch);
+            }
+        })
+        .await
+    })
+    .await
+    .map_err(|_| failure("The desktop did not publish its NTFS snapshot"))??;
+    let revision = wait_for_row(ui, old, None).await?;
+    fs::rename(before, &after).map_err(|error| failure(&error.to_string()))?;
+    let old_name = after.join("desktop-journal-old.txt");
+    let revision = wait_for_row(ui, old_name.clone(), Some(revision)).await?;
+    let new_name = after.join("desktop-journal-new.txt");
+    fs::rename(old_name, &new_name).map_err(|error| failure(&error.to_string()))?;
+    wait_for_row(ui, new_name, Some(revision)).await?;
+    println!("NTFS desktop query refreshed after both directory and file renames");
+    Ok(())
+}
+
+async fn wait_for_row(
+    ui: &Weak<SearchBar>,
+    expected: PathBuf,
+    previous: Option<i32>,
+) -> VelocityResult<i32> {
+    let expected = Arc::new(expected);
+    timeout(Duration::from_secs(20), async {
+        loop {
+            let expected = expected.clone();
+            let generation = on_ui(ui, move |ui| {
+                let rows = ui.get_search_results();
+                let generation = ui.get_search_generation();
+                (!ui.get_searching()
+                    && previous != Some(generation)
+                    && rows.row_count() == 1
+                    && rows
+                        .row_data(0)
+                        .is_some_and(|row| Path::new(row.path.as_str()) == expected.as_path()))
+                .then_some(generation)
+            })
+            .await?;
+            if let Some(generation) = generation {
+                return Ok(generation);
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        failure(&format!(
+            "The active query did not show {}",
+            expected.display()
+        ))
+    })?
 }
 
 pub(crate) struct Run {

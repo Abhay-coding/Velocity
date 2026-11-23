@@ -111,6 +111,22 @@ impl RootCoverage {
         }
         debug!(path = %path.display(), reason, "Skipped index location");
     }
+
+    fn same_coverage(&self, other: &Self) -> bool {
+        #[cfg(windows)]
+        if let (Some(current), Some(previous)) = (&self.ntfs, &other.ntfs) {
+            if !current.same_projection(previous) {
+                return false;
+            }
+            // The checkpoint can advance even when the searchable projection
+            // is unchanged. Avoid refreshing the UI for that alone.
+            return Self {
+                ntfs: other.ntfs.clone(),
+                ..self.clone()
+            } == *other;
+        }
+        self == other
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -221,12 +237,13 @@ impl FolderProvider {
                 || stop.load(Ordering::Acquire) || epoch.load(Ordering::Acquire) != starting_epoch;
             let started = Instant::now();
             let (mut coverage, mut by_root) = {
-                let mut state = state.write().unwrap();
-                state.status.scanning = true;
+                let state = state.read().unwrap();
                 (state.published_roots.clone(), state.by_root.clone())
             };
             let mut visited = HashSet::new();
             let mut changed = false;
+            #[cfg(windows)]
+            let mut failed_journal_roots = Vec::<&Path>::new();
             for (index, root) in roots.iter().enumerate() {
                 if cancelled() {
                     break;
@@ -235,13 +252,47 @@ impl FolderProvider {
                     // Rescan descendants of changed roots in case a formerly
                     // redundant root now provides independent coverage.
                     let affected = roots.iter().zip(dirty).any(|(other, dirty)| {
+                        #[cfg(windows)]
+                        if matches!(dirty, Pending::Journal) {
+                            return root == other;
+                        }
                         !matches!(dirty, Pending::Clean) && (root.starts_with(other) || other.starts_with(root))
                     });
+                    #[cfg(windows)]
+                    let affected = affected || failed_journal_roots.iter().any(|parent| root.starts_with(parent));
                     if !affected {
                         if let Some(path) = &coverage[index].canonical {
                             visited.insert(path.clone());
                         }
                         continue;
+                    }
+                    #[cfg(windows)]
+                    if let (Some(batch_bytes), Some(snapshot)) = (ntfs_batch_bytes, &coverage[index].ntfs) {
+                        match ntfs::tail(snapshot, &coverage[index], &exclusions, batch_bytes, cancelled) {
+                            Ok(updated) => {
+                                if let Some((next, mut projected)) = updated {
+                                    if !next.same_projection(snapshot) {
+                                        let mut found: Vec<_> = next.entries().collect();
+                                        found.sort_unstable_by(compare_entries);
+                                        if *by_root[index] != found {
+                                            by_root[index] = Arc::new(found);
+                                            changed = true;
+                                        }
+                                    }
+                                    projected.ntfs = Some(Arc::new(next));
+                                    coverage[index] = projected;
+                                }
+                                if let Some(path) = &coverage[index].canonical {
+                                    visited.insert(path.clone());
+                                }
+                                continue;
+                            }
+                            Err(_) if cancelled() => break,
+                            Err(error) => {
+                                failed_journal_roots.push(root);
+                                debug!(root = %root.display(), %error, "Rebuilding after NTFS journal read failed");
+                            }
+                        }
                     }
                     if let Pending::Paths(paths) = &dirty[index] {
                         #[cfg(windows)]
@@ -266,8 +317,11 @@ impl FolderProvider {
                         }
                     }
                 }
-                state.write().unwrap().status.roots[index] =
-                    RootCoverage::new(root.clone(), RootState::Scanning);
+                {
+                    let mut state = state.write().unwrap();
+                    state.status.scanning = true;
+                    state.status.roots[index] = RootCoverage::new(root.clone(), RootState::Scanning);
+                }
                 let mut found = Vec::new();
                 coverage[index] = folder::scan(
                     root.clone(),
@@ -307,7 +361,8 @@ impl FolderProvider {
                 state.status.roots = state.published_roots.clone();
                 return;
             }
-            let coverage_changed = state.published_roots != coverage;
+            let coverage_changed = state.published_roots.iter().zip(&coverage)
+                .any(|(previous, next)| !previous.same_coverage(next));
             state.status.roots = coverage.clone();
             state.searchable = coverage.iter().any(|root| root.state == RootState::Ready);
             state.published_roots = coverage;

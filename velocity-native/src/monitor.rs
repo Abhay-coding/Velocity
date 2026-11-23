@@ -19,6 +19,8 @@ pub(crate) enum Pending {
     Clean,
     Paths(HashSet<PathBuf>),
     Scan,
+    #[cfg(windows)]
+    Journal,
 }
 
 #[cfg(windows)]
@@ -47,7 +49,7 @@ impl Signals {
         match &mut *pending {
             Pending::Clean => *pending = Pending::Paths(paths),
             Pending::Paths(previous) => previous.extend(paths),
-            Pending::Scan => return,
+            Pending::Scan | Pending::Journal => return,
         }
         if matches!(&*pending, Pending::Paths(paths) if paths.len() > 32) {
             *pending = Pending::Scan;
@@ -91,17 +93,32 @@ pub(crate) async fn monitor(provider: Arc<FolderProvider>) {
     if let Err(error) = provider.initialize().await {
         warn!(%error, "Could not initialize the folder index");
     }
+    let mut journal_tick = tokio::time::interval(Duration::from_millis(250));
+    journal_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
+        if provider.stop.load(Ordering::Acquire) {
+            break;
+        }
         tokio::select! {
             _ = provider.stopped.notified() => break,
-            _ = signals.changed.notified() => {},
+            _ = signals.changed.notified() => tokio::time::sleep(Duration::from_millis(80)).await,
+            _ = journal_tick.tick(), if cfg!(windows) && provider.ntfs_batch_bytes.is_some() => {},
         }
-        tokio::time::sleep(Duration::from_millis(80)).await;
         let dirty: Vec<_> = signals
             .dirty
             .iter()
             .map(|dirty| std::mem::take(&mut *dirty.lock().unwrap()))
             .collect();
+        #[cfg(windows)]
+        let mut dirty = dirty;
+        #[cfg(windows)]
+        if provider.ntfs_batch_bytes.is_some() {
+            for (pending, root) in dirty.iter_mut().zip(provider.status().roots) {
+                if root.ntfs.is_some() && matches!(pending, Pending::Clean) {
+                    *pending = Pending::Journal;
+                }
+            }
+        }
         if dirty.iter().any(|dirty| !matches!(dirty, Pending::Clean)) {
             if let Err(error) = provider.rebuild_roots(Some(dirty)).await {
                 warn!(%error, "Could not reconcile changed folders");

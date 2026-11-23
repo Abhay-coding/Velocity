@@ -29,8 +29,8 @@ use crate::{
 };
 
 mod snapshot;
-pub(crate) use snapshot::capture;
 pub use snapshot::ScopedSnapshot;
+pub(crate) use snapshot::{capture, tail};
 
 pub const DEFAULT_BATCH_BYTES: usize = 64 * 1024;
 
