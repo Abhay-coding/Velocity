@@ -116,9 +116,9 @@ fn decode(wide: &[u16]) -> String {
 pub(crate) fn watch(
     root: &Path,
     stop: &AtomicBool,
-    mut signal: impl FnMut(Notice),
+    signal: &mut dyn FnMut(Notice),
 ) -> io::Result<()> {
-    watch_with_buffer(root, stop, &mut [0u32; 8192], &mut signal)
+    watch_with_buffer(root, stop, &mut [0u32; 8192], signal)
 }
 
 fn directory_id(handle: &Handle) -> io::Result<(u32, u32, u32)> {
@@ -150,11 +150,11 @@ fn open_directory(root: &Path) -> io::Result<Handle> {
     )
 }
 
-fn watch_with_buffer(
+pub(crate) fn watch_with_buffer(
     root: &Path,
     stop: &AtomicBool,
     buffer: &mut [u32],
-    signal: &mut impl FnMut(Notice),
+    signal: &mut dyn FnMut(Notice),
 ) -> io::Result<()> {
     let directory = open_directory(root)?;
     let identity = directory_id(&directory)?;

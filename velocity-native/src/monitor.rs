@@ -1,3 +1,5 @@
+#[cfg(windows)]
+use std::io;
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
@@ -67,6 +69,18 @@ impl Drop for StopOnDrop {
 }
 
 pub(crate) async fn monitor(provider: Arc<FolderProvider>) {
+    monitor_with(
+        provider,
+        #[cfg(windows)]
+        Arc::new(crate::windows::watch),
+    )
+    .await;
+}
+
+#[cfg(windows)]
+type Watch = dyn Fn(&Path, &AtomicBool, &mut dyn FnMut(Notice)) -> io::Result<()> + Send + Sync;
+
+async fn monitor_with(provider: Arc<FolderProvider>, #[cfg(windows)] watcher: Arc<Watch>) {
     let signals = Arc::new(Signals {
         changed: Notify::new(),
         dirty: provider.roots.iter().map(|_| Mutex::default()).collect(),
@@ -74,15 +88,29 @@ pub(crate) async fn monitor(provider: Arc<FolderProvider>) {
     });
     let _stop = StopOnDrop(signals.clone());
     let mut started = Vec::new();
+    let mut polling = Vec::new();
     for (index, root) in provider.roots.iter().cloned().enumerate() {
         let (ready, signal) = oneshot::channel();
         let signals = signals.clone();
+        #[cfg(windows)]
+        let watcher = watcher.clone();
         match std::thread::Builder::new()
             .name("velocity-folder-watch".into())
-            .spawn(move || watch(root, index, signals, ready))
-        {
+            .spawn(move || {
+                watch(
+                    root,
+                    index,
+                    signals,
+                    ready,
+                    #[cfg(windows)]
+                    watcher.as_ref(),
+                )
+            }) {
             Ok(_) => started.push(signal),
-            Err(error) => warn!(%error, "Could not start a folder watcher"),
+            Err(error) => {
+                warn!(%error, "Could not start a folder watcher. Polling this root");
+                polling.push(index);
+            }
         }
     }
     // Start the watches before scanning. Changes that arrive during the walk
@@ -95,6 +123,8 @@ pub(crate) async fn monitor(provider: Arc<FolderProvider>) {
     }
     let mut journal_tick = tokio::time::interval(Duration::from_millis(250));
     journal_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut fallback_tick = tokio::time::interval(Duration::from_secs(2));
+    fallback_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         if provider.stop.load(Ordering::Acquire) {
             break;
@@ -103,6 +133,11 @@ pub(crate) async fn monitor(provider: Arc<FolderProvider>) {
             _ = provider.stopped.notified() => break,
             _ = signals.changed.notified() => tokio::time::sleep(Duration::from_millis(80)).await,
             _ = journal_tick.tick(), if cfg!(windows) && provider.ntfs_batch_bytes.is_some() => {},
+            _ = fallback_tick.tick(), if !polling.is_empty() => {
+                for &index in &polling {
+                    *signals.dirty[index].lock().unwrap() = Pending::Scan;
+                }
+            },
         }
         let dirty: Vec<_> = signals
             .dirty
@@ -127,14 +162,116 @@ pub(crate) async fn monitor(provider: Arc<FolderProvider>) {
     }
 }
 
-fn watch(root: PathBuf, index: usize, signals: Arc<Signals>, ready: oneshot::Sender<()>) {
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use crate::{RootState, SearchQuery};
+    use std::{
+        collections::BTreeSet,
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    #[tokio::test]
+    async fn overflow_during_creates_moves_and_deletes_converges_to_manifest() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("velocity-overflow-{}-{stamp}", std::process::id()));
+        let old = root.join("original-directory");
+        fs::create_dir_all(&old).unwrap();
+        let keep = "long-descendant-filename.txt";
+        fs::write(old.join(keep), "original").unwrap();
+        let obsolete = root.join("obsolete-file-before-burst.txt");
+        fs::write(&obsolete, "delete me").unwrap();
+
+        let provider = Arc::new(FolderProvider::new(vec![root.clone()], &[]).unwrap());
+        let overflow = Arc::new(AtomicBool::new(false));
+        let observed = overflow.clone();
+        let monitor = tokio::spawn(monitor_with(
+            provider.clone(),
+            Arc::new(move |root, stop, signal| {
+                crate::windows::watch_with_buffer(root, stop, &mut [0; 4], &mut |notice| {
+                    if matches!(notice, Notice::Scan("notification buffer overflow")) {
+                        observed.store(true, Ordering::Release);
+                    }
+                    signal(notice);
+                })
+            }),
+        ));
+        let compare = async {
+            while provider.status().roots[0].state != RootState::Ready {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let new = root.join("renamed-directory-after-burst");
+            let incoming = root.join("new-file-after-overflow.txt");
+            for index in 0..32 {
+                fs::write(
+                    root.join(format!("file-created-during-overflow-{index:02}.txt")),
+                    "burst",
+                )
+                .unwrap();
+            }
+            fs::rename(&old, &new).unwrap();
+            fs::remove_file(&obsolete).unwrap();
+            fs::rename(root.join("file-created-during-overflow-00.txt"), &incoming).unwrap();
+            fs::remove_file(root.join("file-created-during-overflow-01.txt")).unwrap();
+            let mut manifest = BTreeSet::from([
+                (new.clone(), true),
+                (new.join(keep), false),
+                (incoming, false),
+            ]);
+            manifest.extend((2..32).map(|index| {
+                (
+                    root.join(format!("file-created-during-overflow-{index:02}.txt")),
+                    false,
+                )
+            }));
+            loop {
+                let page = provider
+                    .search(SearchQuery {
+                        text: String::new(),
+                        offset: 0,
+                        max_results: 100,
+                    })
+                    .await
+                    .unwrap();
+                let actual = page
+                    .results
+                    .into_iter()
+                    .map(|row| (row.path, row.is_directory))
+                    .collect();
+                if overflow.load(Ordering::Acquire) && manifest == actual {
+                    assert_eq!(page.total_count, Some(manifest.len()));
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        let result = tokio::time::timeout(Duration::from_secs(10), compare).await;
+        provider.shutdown().await.unwrap();
+        monitor.await.unwrap();
+        fs::remove_dir_all(root).unwrap();
+        result.expect("the real notification overflow must trigger a matching snapshot");
+    }
+}
+
+fn watch(
+    root: PathBuf,
+    index: usize,
+    signals: Arc<Signals>,
+    ready: oneshot::Sender<()>,
+    #[cfg(windows)] watcher: &Watch,
+) {
     let mut ready = Some(ready);
     let mut reopen = false;
     while !signals.stop.load(Ordering::Acquire) {
         #[cfg(windows)]
         let result = {
             let mut registered = false;
-            crate::windows::watch(&root, &signals.stop, |notice| {
+            watcher(&root, &signals.stop, &mut |notice| {
                 if let Some(ready) = ready.take() {
                     let _ = ready.send(());
                 }

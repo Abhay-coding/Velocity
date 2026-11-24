@@ -15,10 +15,11 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use windows::Win32::System::Ioctl::NTFS_VOLUME_DATA_BUFFER;
 
 /// Experimental NTFS MFT parser
 ///
@@ -28,6 +29,7 @@ pub struct MftParser {
     volume_path: PathBuf,
     boot_sector: Option<BootSectorInfo>,
     volume_handle: Option<File>,
+    record_count: Option<u64>,
     /// Cache of parsed records for performance
     record_cache: Arc<RwLock<HashMap<u64, MftRecord>>>,
 }
@@ -38,6 +40,7 @@ impl MftParser {
             volume_path,
             boot_sector: None,
             volume_handle: None,
+            record_count: None,
             record_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -50,14 +53,83 @@ impl MftParser {
         // Read boot sector first to get volume geometry
         let volume_str = self.volume_path.to_string_lossy().to_string();
         let boot_sector = read_boot_sector(&volume_str)?;
-        self.boot_sector = Some(boot_sector.clone());
-
-        // Open volume handle for raw access
-        // Note: This requires administrator privileges
         let handle = self.open_volume_handle(&volume_str)?;
+        let volume_data = Self::query_volume_data(&handle)?;
+        let (mft_offset, record_count) = Self::mft_bounds(&boot_sector, &volume_data)?;
+
+        // The raw reader can only follow a contiguous MFT. Confirm that its
+        // first data run covers every record before using linear disk offsets.
+        let first_record = Self::read_at_offset(&handle, mft_offset, boot_sector.bytes_per_record as usize)?;
+        let first_record = MftRecord::parse(&first_record, 0, &boot_sector)?;
+        let first_run = first_record.attributes.iter().find_map(|attribute| match attribute {
+            MftAttribute::Data(data) if !data.resident && data.name.is_none() => data.runlist.first(),
+            _ => None,
+        });
+        let contiguous_len = first_run
+            .filter(|run| u64::try_from(run.lcn).ok() == Some(boot_sector.mft_lcn))
+            .and_then(|run| run.length.checked_mul(u64::from(boot_sector.bytes_per_cluster)));
+        if !contiguous_len.is_some_and(|len| len >= volume_data.MftValidDataLength as u64) {
+            return Err(VelocityError::Config(
+                "The experimental MFT reader requires a contiguous master file table".to_string(),
+            ));
+        }
+
+        self.record_cache.write().await.clear();
+        self.boot_sector = Some(boot_sector);
         self.volume_handle = Some(handle);
+        self.record_count = Some(record_count);
 
         Ok(())
+    }
+
+    fn query_volume_data(handle: &File) -> VelocityResult<NTFS_VOLUME_DATA_BUFFER> {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::{Ioctl::FSCTL_GET_NTFS_VOLUME_DATA, IO::DeviceIoControl};
+
+        let mut data = NTFS_VOLUME_DATA_BUFFER::default();
+        let size = std::mem::size_of_val(&data) as u32;
+        let mut returned = 0;
+        // File owns the open handle for this synchronous call. Windows writes
+        // at most size bytes to the initialized SDK structure.
+        unsafe {
+            DeviceIoControl(
+                HANDLE(handle.as_raw_handle()),
+                FSCTL_GET_NTFS_VOLUME_DATA,
+                None,
+                0,
+                Some((&mut data as *mut NTFS_VOLUME_DATA_BUFFER).cast()),
+                size,
+                Some(&mut returned),
+                None,
+            )
+        }
+        .map_err(|error| VelocityError::Config(format!("Failed to query NTFS volume data: {error}")))?;
+        if returned < size {
+            return Err(VelocityError::Config("Incomplete NTFS volume data".to_string()));
+        }
+        Ok(data)
+    }
+
+    fn mft_bounds(boot: &BootSectorInfo, data: &NTFS_VOLUME_DATA_BUFFER) -> VelocityResult<(u64, u64)> {
+        let invalid = || VelocityError::Config("Invalid master file table bounds".to_string());
+        let length = u64::try_from(data.MftValidDataLength).map_err(|_| invalid())?;
+        let record_size = u64::from(boot.bytes_per_record);
+        if record_size == 0
+            || data.BytesPerFileRecordSegment != boot.bytes_per_record
+            || data.BytesPerCluster != boot.bytes_per_cluster
+            || u64::try_from(data.MftStartLcn).ok() != Some(boot.mft_lcn)
+            || length == 0
+            || length % record_size != 0
+        {
+            return Err(invalid());
+        }
+        let offset = boot.mft_lcn.checked_mul(u64::from(boot.bytes_per_cluster)).ok_or_else(invalid)?;
+        let volume_length = boot.total_sectors.checked_mul(u64::from(boot.bytes_per_sector)).ok_or_else(invalid)?;
+        if offset.checked_add(length).is_none_or(|end| end > volume_length) {
+            return Err(invalid());
+        }
+        Ok((offset, length / record_size))
     }
 
     /// Open volume handle with proper flags for raw MFT access
@@ -110,10 +182,7 @@ impl MftParser {
     }
 
     /// Read raw bytes from volume at offset
-    fn read_at_offset(&self, offset: u64, size: usize) -> VelocityResult<Vec<u8>> {
-        let mut handle = self.volume_handle.as_ref()
-            .ok_or_else(|| VelocityError::Config("Volume not opened".to_string()))?;
-
+    fn read_at_offset(mut handle: &File, offset: u64, size: usize) -> VelocityResult<Vec<u8>> {
         let mut buffer = vec![0u8; size];
         // Use Seek + ReadExact for portable offset reading
         handle.seek(SeekFrom::Start(offset))
@@ -122,6 +191,18 @@ impl MftParser {
             .map_err(|e| VelocityError::Config(format!("Failed to read at offset {}: {}", offset, e)))?;
 
         Ok(buffer)
+    }
+
+    fn read_record_bytes(&self, record_number: u64, boot: &BootSectorInfo) -> VelocityResult<Vec<u8>> {
+        let handle = self.volume_handle.as_ref()
+            .ok_or_else(|| VelocityError::Config("Volume not opened".to_string()))?;
+        if self.record_count.is_none_or(|count| record_number >= count) {
+            return Err(VelocityError::Config("Record lies beyond the master file table".to_string()));
+        }
+        // open() validates this entire range before making the volume available.
+        let offset = boot.mft_lcn * u64::from(boot.bytes_per_cluster)
+            + record_number * u64::from(boot.bytes_per_record);
+        Self::read_at_offset(handle, offset, boot.bytes_per_record as usize)
     }
 
     /// Read MFT record by record number
@@ -137,13 +218,7 @@ impl MftParser {
         let boot_sector = self.boot_sector.as_ref()
             .ok_or_else(|| VelocityError::Config("Boot sector not loaded".to_string()))?;
 
-        // Calculate MFT offset
-        // MFT starts at mft_lcn * bytes_per_cluster
-        let mft_offset = boot_sector.mft_lcn * boot_sector.bytes_per_cluster as u64;
-        let record_offset = mft_offset + record_number * boot_sector.bytes_per_record as u64;
-
-        // Read record data
-        let record_data = self.read_at_offset(record_offset, boot_sector.bytes_per_record as usize)?;
+        let record_data = self.read_record_bytes(record_number, boot_sector)?;
 
         // Parse record
         let record = MftRecord::parse(&record_data, record_number, boot_sector)?;
@@ -159,60 +234,33 @@ impl MftParser {
 
     /// Enumerate all files in MFT (sequential scan)
     pub async fn enumerate_files(&mut self) -> VelocityResult<Vec<MftFileEntry>> {
-        let _boot_sector = self.boot_sector.as_ref()
+        let boot_sector = self.boot_sector.as_ref()
             .ok_or_else(|| VelocityError::Config("Boot sector not loaded".to_string()))?;
-
-        // Estimate total records (MFT size / record size)
-        // We'll scan until we hit empty records
+        let record_count = self.record_count
+            .ok_or_else(|| VelocityError::Config("Volume not opened".to_string()))?;
+        self.record_cache.write().await.clear();
         let mut entries = Vec::new();
-        let mut consecutive_empty = 0;
-        const MAX_CONSECUTIVE_EMPTY: u64 = 1000;
-
-        // Start from record 0 ($MFT itself) and skip system files
-        // User files typically start after record 23 or so
-        for record_number in 0.. {
-            match self.read_record(record_number).await {
-                Ok(record) => {
-                    if record.header.is_in_use() && record.header.used_size > 0 {
-                        consecutive_empty = 0;
-
-                        // Skip system files (records < 24 typically)
-                        if record_number >= 24 {
-                            if let Some(name) = &record.file_name {
-                                if !name.is_empty() {
-                                    entries.push(MftFileEntry {
-                                        file_reference: record.header.file_reference(record_number),
-                                        name: name.clone(),
-                                        path: PathBuf::from(name), // Will be resolved later
-                                        size: record.size,
-                                        modified: filetime_to_unix(record.modification_time),
-                                        is_directory: record.is_directory,
-                                        extension: record.file_name.as_ref().and_then(|n| {
-                                            n.rsplit('.').next().map(|s| s.to_lowercase())
-                                        }),
-                                    });
-                                }
-                            }
-                        }
-                    } else {
-                        consecutive_empty += 1;
-                        if consecutive_empty >= MAX_CONSECUTIVE_EMPTY {
-                            break; // Assume we've passed all used records
-                        }
-                    }
-                }
-                Err(_) => {
-                    consecutive_empty += 1;
-                    if consecutive_empty >= MAX_CONSECUTIVE_EMPTY {
-                        break;
-                    }
-                }
+        for record_number in 24..record_count {
+            let bytes = self.read_record_bytes(record_number, boot_sector)?;
+            let Ok(record) = MftRecord::parse(&bytes, record_number, boot_sector) else {
+                continue;
+            };
+            let Some(name) = record.file_name.as_deref().filter(|name| !name.is_empty()) else {
+                continue;
+            };
+            if !record.header.is_in_use() {
+                continue;
             }
-
-            // Safety limit
-            if record_number > 10_000_000 {
-                break;
-            }
+            entries.push(MftFileEntry {
+                file_reference: record.header.file_reference(record_number),
+                name: name.to_owned(),
+                path: PathBuf::from(name),
+                size: record.size,
+                modified: filetime_to_unix(record.modification_time),
+                is_directory: record.is_directory,
+                extension: name.rsplit('.').next().map(|suffix| suffix.to_lowercase()),
+            });
+            self.record_cache.write().await.insert(record_number, record);
         }
 
         Ok(entries)
@@ -298,7 +346,7 @@ impl MftParser {
     }
 
     /// Extract drive letter from volume path (e.g., "\\.\C:" -> Some('C'))
-    fn extract_drive_letter(volume_path: &PathBuf) -> Option<char> {
+    fn extract_drive_letter(volume_path: &Path) -> Option<char> {
         let path_str = volume_path.to_string_lossy();
         let path = path_str.strip_prefix(r"\\.\").unwrap_or(&path_str);
         let bytes = path.as_bytes();
@@ -315,6 +363,7 @@ impl MftParser {
             // File handle will be closed on drop
             drop(handle);
         }
+        self.record_count = None;
         let mut cache = self.record_cache.write().await;
         cache.clear();
     }
@@ -348,6 +397,7 @@ pub struct MftFileEntry {
 /// Experimental MFT-based provider; the scanner does not handle fragmented MFTs.
 pub struct MftProvider {
     parser: Arc<RwLock<MftParser>>,
+    indexed_drive: String,
     indexed_files: Arc<RwLock<Vec<MftFileEntry>>>,
     is_indexing: Arc<RwLock<bool>>,
     last_stats: Arc<RwLock<Option<IndexStats>>>,
@@ -375,8 +425,12 @@ impl MftProvider {
             }
         };
 
+        let indexed_drive = MftParser::extract_drive_letter(&volume_path)
+            .map(|drive| format!("{drive}:"))
+            .unwrap_or_else(|| volume_path.to_string_lossy().into_owned());
         Self {
             parser: Arc::new(RwLock::new(MftParser::new(volume_path))),
+            indexed_drive,
             indexed_files: Arc::new(RwLock::new(Vec::new())),
             is_indexing: Arc::new(RwLock::new(false)),
             last_stats: Arc::new(RwLock::new(None)),
@@ -452,11 +506,11 @@ impl IndexProvider for MftProvider {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs()),
-            drives_indexed: vec!["C:".to_string()], // TODO: get actual drives
+            drives_indexed: vec![self.indexed_drive.clone()],
             is_indexing,
             indexing_progress: if is_indexing {
                 Some(IndexingProgress {
-                    current_drive: "C:".to_string(),
+                    current_drive: self.indexed_drive.clone(),
                     files_processed: files.len() as u64,
                     estimated_total: files.len() as u64 * 2, // rough estimate
                     current_path: None,
@@ -520,5 +574,103 @@ impl IndexProvider for MftProvider {
         let mut parser = self.parser.write().await;
         parser.close().await;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn geometry() -> BootSectorInfo {
+        BootSectorInfo {
+            bytes_per_sector: 512,
+            sectors_per_cluster: 8,
+            bytes_per_cluster: 4096,
+            total_sectors: 30_000_000,
+            mft_lcn: 4,
+            mft_mirror_lcn: 50,
+            bytes_per_record: 1024,
+            bytes_per_index_record: 4096,
+            volume_serial: 0,
+            oem_id: "NTFS".to_string(),
+        }
+    }
+
+    #[test]
+    fn bounds_use_the_mft_length_without_a_fixed_record_cap() {
+        let boot = geometry();
+        let mut data = NTFS_VOLUME_DATA_BUFFER {
+            MftStartLcn: 4,
+            MftValidDataLength: 10_000_002 * 1024,
+            BytesPerCluster: 4096,
+            BytesPerFileRecordSegment: 1024,
+            ..Default::default()
+        };
+        assert_eq!(MftParser::mft_bounds(&boot, &data).unwrap(), (16_384, 10_000_002));
+
+        data.MftValidDataLength += 1;
+        assert!(MftParser::mft_bounds(&boot, &data).is_err());
+        data.MftValidDataLength = 30_000_000 * 512;
+        assert!(MftParser::mft_bounds(&boot, &data).is_err());
+    }
+
+    fn named_record() -> [u8; 1024] {
+        let mut record = [0u8; 1024];
+        record[..4].copy_from_slice(b"FILE");
+        record[4..6].copy_from_slice(&48u16.to_le_bytes());
+        record[6..8].copy_from_slice(&3u16.to_le_bytes());
+        record[16..18].copy_from_slice(&1u16.to_le_bytes());
+        record[20..22].copy_from_slice(&64u16.to_le_bytes());
+        record[22..24].copy_from_slice(&1u16.to_le_bytes());
+        record[24..28].copy_from_slice(&164u32.to_le_bytes());
+        record[28..32].copy_from_slice(&1024u32.to_le_bytes());
+        record[48..50].copy_from_slice(&[0xaa, 0xbb]);
+        record[510..512].copy_from_slice(&[0xaa, 0xbb]);
+        record[1022..1024].copy_from_slice(&[0xaa, 0xbb]);
+        // Resident $FILE_NAME attribute containing the one-character name "x".
+        record[64..68].copy_from_slice(&0x30u32.to_le_bytes());
+        record[68..72].copy_from_slice(&96u32.to_le_bytes());
+        record[80..84].copy_from_slice(&68u32.to_le_bytes());
+        record[84..86].copy_from_slice(&24u16.to_le_bytes());
+        record[152] = 1;
+        record[153] = 1;
+        record[154..156].copy_from_slice(&(b'x' as u16).to_le_bytes());
+        record[160..164].copy_from_slice(&u32::MAX.to_le_bytes());
+        record
+    }
+
+    #[tokio::test]
+    async fn scan_past_unused_records_and_stop_at_the_mft_boundary() {
+        let boot = geometry();
+        let path = std::env::temp_dir().join(format!("velocity-mft-gap-{}.bin", std::process::id()));
+        let mut file = File::options().read(true).write(true).create_new(true).open(&path).unwrap();
+        let record_number = 1025u64;
+        let start = boot.mft_lcn * u64::from(boot.bytes_per_cluster);
+        file.seek(SeekFrom::Start(start + record_number * 1024)).unwrap();
+        file.write_all(&named_record()).unwrap();
+        // A valid-looking record past the end must not be mistaken for MFT data.
+        file.write_all(&named_record()).unwrap();
+
+        let mut parser = MftParser::new(PathBuf::from(r"\\.\D:"));
+        parser.boot_sector = Some(boot);
+        parser.volume_handle = Some(file);
+        parser.record_count = Some(record_number + 1);
+        let entries = parser.enumerate_files().await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "x");
+        assert_eq!(entries[0].file_reference, (1u64 << 48) | record_number);
+        assert!(parser.read_record(record_number + 1).await.is_err());
+        drop(parser);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stats_show_the_configured_drive_even_while_indexing() {
+        let provider = MftProvider::new(PathBuf::from(r"\\.\d:"));
+        assert_eq!(provider.stats().await.unwrap().drives_indexed, ["D:"]);
+        *provider.is_indexing.write().await = true;
+        let stats = provider.stats().await.unwrap();
+        assert_eq!(stats.indexing_progress.unwrap().current_drive, "D:");
     }
 }

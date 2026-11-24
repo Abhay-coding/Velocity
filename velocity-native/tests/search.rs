@@ -118,6 +118,115 @@ async fn live_changes_and_reconnect_converge_independently() {
 
 #[cfg(windows)]
 #[tokio::test]
+#[ignore = "uses the temporary SMB share created by tools/verify-folder-reconnect.ps1"]
+async fn network_root_reconnects_and_reconciles_downtime() {
+    let stage = PathBuf::from(std::env::var_os("VELOCITY_M8_STAGE").unwrap());
+    let remote = PathBuf::from(std::env::var_os("VELOCITY_M8_SHARE").unwrap());
+    let local = stage.join("local");
+    let backing = stage.join("network");
+    let provider = Arc::new(FolderProvider::new(vec![remote.clone(), local.clone()], &[]).unwrap());
+    let monitor = provider.start_monitor();
+    let healthy = local.join("still-searchable.txt");
+    let old = remote.join("before-disconnect.txt");
+    let state = |root: &Path| {
+        provider
+            .status()
+            .roots
+            .into_iter()
+            .find(|item| item.root == root)
+            .unwrap()
+            .state
+    };
+    wait_for(async || state(&remote) == RootState::Ready && state(&local) == RootState::Ready)
+        .await;
+    assert!(matches_manifest(&provider, &[(old, false), (healthy.clone(), false)]).await);
+
+    fs::write(stage.join("offline-request"), "").unwrap();
+    wait_for(async || {
+        assert_eq!(state(&local), RootState::Ready);
+        assert_eq!(
+            provider
+                .search(query("still-searchable", 0, 10))
+                .await
+                .unwrap()
+                .total_count,
+            Some(1)
+        );
+        state(&remote) == RootState::Unavailable
+    })
+    .await;
+    assert!(matches_manifest(&provider, &[(healthy.clone(), false)]).await);
+    assert!(fs::read_dir(&remote).is_err());
+    fs::remove_file(backing.join("before-disconnect.txt")).unwrap();
+    fs::create_dir(backing.join("changed-offline")).unwrap();
+    fs::write(
+        backing.join("changed-offline/after-reconnect.txt"),
+        "offline edit",
+    )
+    .unwrap();
+    fs::write(stage.join("offline-observed"), "").unwrap();
+
+    let updated = remote.join("changed-offline/after-reconnect.txt");
+    let dir = remote.join("changed-offline");
+    let recovered = [
+        (healthy.clone(), false),
+        (dir.clone(), true),
+        (updated, false),
+    ];
+    wait_for(async || {
+        assert_eq!(state(&local), RootState::Ready);
+        assert_eq!(
+            provider
+                .search(query("still-searchable", 0, 10))
+                .await
+                .unwrap()
+                .total_count,
+            Some(1)
+        );
+        state(&remote) == RootState::Ready && matches_manifest(&provider, &recovered).await
+    })
+    .await;
+    provider.shutdown().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), monitor)
+        .await
+        .unwrap()
+        .unwrap();
+
+    fs::rename(
+        backing.join("changed-offline/after-reconnect.txt"),
+        backing.join("after-downtime.txt"),
+    )
+    .unwrap();
+    fs::remove_dir(backing.join("changed-offline")).unwrap();
+    let restarted = FolderProvider::new(vec![remote.clone(), local], &[]).unwrap();
+    restarted.initialize().await.unwrap();
+    assert!(
+        matches_manifest(
+            &restarted,
+            &[(healthy, false), (remote.join("after-downtime.txt"), false)]
+        )
+        .await
+    );
+    println!("SMB root became unavailable, recovered offline changes, and reconciled app downtime; the independent root remained searchable");
+}
+
+#[cfg(windows)]
+async fn matches_manifest(provider: &FolderProvider, manifest: &[(PathBuf, bool)]) -> bool {
+    let page = provider
+        .search(query("", 0, manifest.len() + 1))
+        .await
+        .unwrap();
+    page.total_count == Some(manifest.len())
+        && page
+            .results
+            .into_iter()
+            .map(|row| (row.path, row.is_directory))
+            .collect::<BTreeSet<_>>()
+            == manifest.iter().cloned().collect()
+}
+
+#[cfg(windows)]
+#[tokio::test]
 #[ignore = "applies and removes a deny ACL on an isolated test directory"]
 async fn denied_subtree_is_absent_from_results_and_counts() {
     use std::process::Command;

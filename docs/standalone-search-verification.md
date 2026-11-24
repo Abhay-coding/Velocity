@@ -19,7 +19,7 @@ The baseline UI asks for at least two characters and debounces edits by 150 ms. 
 | M5 · Scope and access | The Windows acceptance run passed under two distinct account SIDs. The restricted subtree stayed out of the standard observer's results and counts, and the independent root remained searchable. Tests also cover overlapping roots, exclusions, stable NTFS volume identity, and live ACL revocation and recovery. |
 | M6 · NTFS snapshot | Two disposable NTFS volumes passed the exact path and type comparison against independent walks. The opt-in reader captured each volume GUID, journal ID and starting USN before enumeration. It reconciled both hard-link names under the running account's access rules. A forced reader failure returned the same scoped results through folder indexing. |
 | M7 · NTFS journal | Replay catches up from the initial scan position and tails the journal while search is open. The Windows acceptance suite compares live changes with independent walks and checks that the open desktop query refreshes after directory and file renames. |
-| M8 · Folder changes | `ReadDirectoryChangesW` starts before the initial walk. Small file batches update affected entries. Overflow, directory moves, access changes and reconnects use a scoped walk. Tests force a real notification-buffer overflow and exercise renames, moves, hard-link removal, and a simulated root disconnect and reconnect while another root remains searchable. Removable or network media acceptance remains open. [Microsoft directory notification documentation](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-readdirectorychangesw) |
+| M8 · Folder changes | `ReadDirectoryChangesW` starts before the initial walk. Small file batches update affected entries. Overflow, directory moves, access changes and reconnects use a scoped walk. A real notification overflow converged to the expected manifest. A temporary SMB root recovered changes made while disconnected, and a separate local root stayed searchable. [Microsoft directory notification documentation](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-readdirectorychangesw) |
 | M9 · Persistence | Checkpoint validation rejects a mismatched volume, a changed journal ID and out-of-range USNs. Atomic disk snapshots and interrupted-save recovery remain open. Folder mode scans current files at startup. |
 | M10 · Desktop controls | The desktop smoke opened the correct Unicode file and observed the active query refresh and an unavailable root becoming ready. Provider tests cover pause, resume, and monitor shutdown. The full keyboard, tray, hotkey and Retry acceptance run remains open. |
 | M11 · Release performance | Both corpus sizes were exercised. See the benchmark results below for the budgets and the remaining measurements. |
@@ -87,6 +87,22 @@ The startup test renames a file during the initial scan. It then reads again fro
 On 23 November 2026, the snapshot, startup replay, live journal and desktop checks passed. The active query painted the initial result and refreshed after both renames. Both virtual disks were detached and deleted after the run. The locked workspace suite passed all 30 regular tests, and Clippy passed with warnings denied, including the desktop acceptance build.
 
 Ordinary file events refresh the affected directories where possible. Directory moves, hard links, permission changes and ambiguous batches can require a fresh scoped directory walk. The journal cursor and searchable entries publish together. NTFS replay throughput is still part of M11.
+
+## M8 folder overflow and network reconnect acceptance
+
+On Windows, run the regular test to force the watcher to overflow during a burst of file creates, moves and deletes. The test observes the kernel overflow and verifies the complete published path and type manifest and exact count. [Microsoft directory notification documentation](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-readdirectorychangesw)
+
+```powershell
+cargo test --locked -p velocity-native overflow_during_creates_moves_and_deletes_converges_to_manifest
+```
+
+Run the SMB test from an elevated Windows PowerShell with the Windows Server service running. The script creates a temporary share for synthetic data, gives the signed-in account read access, and removes the share and fixture afterward. The test connects through `localhost`. [Microsoft SMB share documentation](https://learn.microsoft.com/en-us/powershell/module/smbshare/new-smbshare)
+
+```powershell
+./tools/verify-folder-reconnect.ps1
+```
+
+On 24 November 2026, both tests passed. The SMB root became unavailable and its old results disappeared. Reconnecting recovered the changed files while the independent local root stayed ready and searchable. Restarting the provider also picked up changes made while it was stopped.
 
 ## Release benchmark
 
