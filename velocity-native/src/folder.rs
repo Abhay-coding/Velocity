@@ -123,6 +123,25 @@ fn path_key(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/").to_lowercase()
 }
 
+pub(crate) fn untouched_skips(coverage: &RootCoverage, paths: &HashSet<PathBuf>) -> bool {
+    if coverage.skipped != coverage.examples.len() as u64 {
+        return false;
+    }
+    coverage.examples.iter().all(|(skipped, _)| {
+        let skipped = path_key(skipped);
+        paths.iter().all(|path| {
+            let changed = path_key(&coverage.root.join(path));
+            skipped != changed
+                && !skipped
+                    .strip_prefix(&changed)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+                && !changed
+                    .strip_prefix(&skipped)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        })
+    })
+}
+
 /// Apply small batches of ordinary file changes. Directory changes, missed
 /// events and access or reparse changes go through the full scoped walk.
 pub(crate) fn reconcile_files(

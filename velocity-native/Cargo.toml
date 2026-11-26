@@ -11,6 +11,7 @@ glob.workspace = true
 memchr = "2"
 
 [target.'cfg(windows)'.dependencies]
+bincode = { version = "2.0.1", default-features = false, features = ["serde", "std"] }
 crc32fast = "1"
 serde.workspace = true
 serde_json.workspace = true
@@ -18,3 +19,4 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 
 [dev-dependencies]
 serde_json.workspace = true
+tracing-subscriber.workspace = true

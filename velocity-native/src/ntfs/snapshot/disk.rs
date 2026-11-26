@@ -2,14 +2,14 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::OsString,
     fs::{self, File, OpenOptions},
-    io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
+    io::{self, BufWriter, Read, Seek, SeekFrom, Write},
     os::windows::ffi::{OsStrExt, OsStringExt},
     path::{Component, Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex,
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -29,6 +29,98 @@ mod tests;
 const FORMAT_VERSION: u32 = 1;
 const SCOPE_VERSION: u32 = 1;
 const MAX_FILE_BYTES: u64 = 1024 * 1024 * 1024;
+const BINARY_MAGIC: [u8; 4] = *b"VSNP";
+
+#[derive(Default)]
+struct PendingWrites {
+    roots: HashMap<PathBuf, RootCoverage>,
+    worker: bool,
+}
+
+pub(crate) struct Cache {
+    pub(crate) directory: PathBuf,
+    pending: Mutex<PendingWrites>,
+    write: Mutex<()>,
+}
+
+impl Cache {
+    pub(crate) fn new(directory: PathBuf) -> Self {
+        Self {
+            directory,
+            pending: Mutex::default(),
+            write: Mutex::default(),
+        }
+    }
+
+    pub(crate) fn save_now(&self, roots: Vec<RootCoverage>, exclusions: &Exclusions) {
+        if roots.is_empty() {
+            return;
+        }
+        // Both the worker and an explicit rebuild take this lock before
+        // removing queued entries so an older write cannot land afterward.
+        let _write = self.write.lock().unwrap();
+        {
+            let mut pending = self.pending.lock().unwrap();
+            for root in &roots {
+                pending.roots.remove(&root.root);
+            }
+        }
+        self.write_roots(roots, exclusions);
+    }
+
+    pub(crate) fn schedule(
+        self: &Arc<Self>,
+        roots: Vec<RootCoverage>,
+        exclusions: Arc<Exclusions>,
+    ) {
+        if roots.is_empty() {
+            return;
+        }
+        let mut pending = self.pending.lock().unwrap();
+        pending
+            .roots
+            .extend(roots.into_iter().map(|root| (root.root.clone(), root)));
+        if pending.worker {
+            return;
+        }
+        pending.worker = true;
+        let cache = self.clone();
+        let spawned = std::thread::Builder::new()
+            .name("velocity-snapshot-write".into())
+            .spawn(move || {
+                loop {
+                    // Keep one recent projection per root while changes arrive.
+                    std::thread::sleep(Duration::from_millis(750));
+                    let _write = cache.write.lock().unwrap();
+                    let roots = {
+                        let mut pending = cache.pending.lock().unwrap();
+                        if pending.roots.is_empty() {
+                            pending.worker = false;
+                            return;
+                        }
+                        std::mem::take(&mut pending.roots)
+                    };
+                    cache.write_roots(roots.into_values(), &exclusions);
+                }
+            });
+        if let Err(error) = spawned {
+            pending.worker = false;
+            tracing::debug!(%error, "Could not start the NTFS snapshot writer");
+        }
+    }
+
+    pub(crate) fn cancel_pending(&self) {
+        self.pending.lock().unwrap().roots.clear();
+    }
+
+    fn write_roots(&self, roots: impl IntoIterator<Item = RootCoverage>, exclusions: &Exclusions) {
+        for root in roots {
+            if let Err(error) = save(&self.directory, &root, exclusions) {
+                tracing::debug!(root = %root.root.display(), %error, "Could not save NTFS snapshot");
+            }
+        }
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct Scope {
@@ -176,7 +268,9 @@ pub(crate) fn restore(
     let Some((canonical, _)) = folder::open_root(root, exclusions, &mut candidates)? else {
         return Ok(None);
     };
+    let started = Instant::now();
     let saved = read_file(file)?.into_snapshot(root, exclusions)?;
+    let decode_ms = started.elapsed().as_millis();
     let mut coverage = RootCoverage::new(root.to_path_buf(), RootState::Ready);
     coverage.canonical = Some(canonical);
     coverage.volume = Some(reader.volume.clone());
@@ -191,6 +285,7 @@ pub(crate) fn restore(
     )?
     .ok_or_else(|| invalid("could not validate saved NTFS scope"))?;
     let changed = !next.same_projection(&saved);
+    tracing::info!(root = %root.display(), decode_ms, restore_ms = started.elapsed().as_millis(), "Restored NTFS snapshot");
     coverage.ntfs = Some(Arc::new(next));
     coverage.ntfs_restored = true;
     Ok(Some((coverage, changed)))
@@ -256,20 +351,22 @@ fn stage_write(cache: &Path, data: &SnapshotFile) -> io::Result<StagedFile> {
 }
 
 fn write_file(file: &mut File, data: &SnapshotFile) -> io::Result<()> {
+    file.write_all(&BINARY_MAGIC)?;
     file.write_all(&[0; 4])?;
     let checksum = {
         let mut output = Checksummed {
             out: BufWriter::new(&mut *file),
             crc: crc32fast::Hasher::new(),
         };
-        serde_json::to_writer(&mut output, data).map_err(io::Error::other)?;
+        bincode::serde::encode_into_std_write(data, &mut output, bincode::config::standard())
+            .map_err(io::Error::other)?;
         output.flush()?;
         std::mem::take(&mut output.crc).finalize()
     };
     if file.stream_position()? > MAX_FILE_BYTES {
         return Err(invalid("NTFS snapshot is too large"));
     }
-    file.seek(SeekFrom::Start(0))?;
+    file.seek(SeekFrom::Start(BINARY_MAGIC.len() as u64))?;
     file.write_all(&checksum.to_le_bytes())?;
     file.sync_all()
 }
@@ -295,19 +392,32 @@ fn read_file(file: File) -> io::Result<SnapshotFile> {
     if file.metadata()?.len() > MAX_FILE_BYTES {
         return Err(invalid("NTFS snapshot is too large"));
     }
-    let mut input = BufReader::new(file);
-    let mut expected = [0; 4];
-    input.read_exact(&mut expected)?;
-    let mut crc = Checksummed {
-        out: io::sink(),
-        crc: crc32fast::Hasher::new(),
-    };
-    io::copy(&mut input, &mut crc)?;
-    if crc.crc.finalize() != u32::from_le_bytes(expected) {
+    let mut bytes = Vec::new();
+    file.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(invalid("NTFS snapshot is too large"));
+    }
+    let (binary, contents) = bytes
+        .strip_prefix(&BINARY_MAGIC)
+        .map_or((false, bytes.as_slice()), |contents| (true, contents));
+    let (checksum, payload) = contents
+        .split_first_chunk::<4>()
+        .ok_or_else(|| invalid("truncated NTFS snapshot"))?;
+    if crc32fast::hash(payload) != u32::from_le_bytes(*checksum) {
         return Err(invalid("NTFS snapshot checksum mismatch"));
     }
-    input.seek(SeekFrom::Start(4))?;
-    serde_json::from_reader(input).map_err(io::Error::other)
+    if binary {
+        let config = bincode::config::standard().with_limit::<{ MAX_FILE_BYTES as usize }>();
+        let (value, used) =
+            bincode::serde::decode_from_slice(payload, config).map_err(io::Error::other)?;
+        if used != payload.len() {
+            return Err(invalid("unexpected data after the NTFS snapshot"));
+        }
+        Ok(value)
+    } else {
+        // M9 used a checksum followed by a JSON payload.
+        serde_json::from_slice(payload).map_err(io::Error::other)
+    }
 }
 
 fn replace(pending: &Path, target: &Path) -> io::Result<()> {

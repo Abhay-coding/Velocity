@@ -1,6 +1,12 @@
 use std::{
-    collections::HashSet, ffi::OsString, fs, io, mem::offset_of, os::windows::ffi::OsStringExt,
-    path::Path, sync::Arc,
+    collections::{HashMap, HashSet},
+    ffi::OsString,
+    fs, io,
+    mem::offset_of,
+    os::windows::ffi::OsStringExt,
+    path::Path,
+    sync::Arc,
+    time::{Duration, Instant},
 };
 
 use windows_sys::Win32::{
@@ -96,6 +102,7 @@ pub(crate) fn capture(
         coverage,
         checkpoint.volume_serial,
         changes.is_empty().then_some(&namespace),
+        None,
         &cancelled,
         &mut progress,
     );
@@ -111,6 +118,7 @@ pub(crate) fn capture(
             coverage,
             checkpoint.volume_serial,
             None,
+            None,
             &cancelled,
             progress,
         );
@@ -121,7 +129,7 @@ pub(crate) fn capture(
         enumeration_start_usn,
         enumeration_batches,
         hard_link_aliases: alias_count(&links),
-        links: Arc::new(links),
+        links,
     };
     if let Some((next, updated_coverage)) = advance(
         &reader,
@@ -168,7 +176,14 @@ fn advance(
 ) -> io::Result<Option<(ScopedSnapshot, RootCoverage)>> {
     let mut next = previous.clone();
     let mut coverage = coverage.clone();
-    let mut changes = read_changes(reader, &mut next.checkpoint, batch_bytes, &cancelled)?;
+    let mut journal_time = Duration::ZERO;
+    let mut read = |checkpoint: &mut Checkpoint| {
+        let started = Instant::now();
+        let changes = read_changes(reader, checkpoint, batch_bytes, &cancelled);
+        journal_time += started.elapsed();
+        changes
+    };
+    let mut changes = read(&mut next.checkpoint)?;
     if next.checkpoint == previous.checkpoint && !validate_scope {
         return Ok(None);
     }
@@ -177,7 +192,7 @@ fn advance(
     changes.scope |= validate_scope;
     for _ in 0..4 {
         if changes.is_empty() {
-            return Ok(Some((next, coverage)));
+            break;
         }
         let (root, canonical) = (
             coverage.root.clone(),
@@ -186,35 +201,40 @@ fn advance(
                 .clone()
                 .ok_or_else(|| invalid("missing NTFS root path"))?,
         );
-        let links = match relist_files(&next, &coverage, exclusions, &changes, &cancelled) {
-            Ok(Some(links)) => links,
-            Err(error) if cancelled() => return Err(error),
-            _ => {
-                coverage.skipped = 0;
-                coverage.examples.clear();
-                project(
-                    &root,
-                    &canonical,
-                    exclusions,
-                    &mut coverage,
-                    next.checkpoint.volume_serial,
-                    None,
-                    &cancelled,
-                    |_| {},
-                )?
-            }
-        };
+        let (links, aliases) =
+            match relist_files(&next, &coverage, exclusions, &changes, &cancelled) {
+                Ok(Some(links)) => (Arc::new(links), next.hard_link_aliases),
+                Err(error) if cancelled() => return Err(error),
+                _ => {
+                    coverage.skipped = 0;
+                    coverage.examples.clear();
+                    let links = project(
+                        &root,
+                        &canonical,
+                        exclusions,
+                        &mut coverage,
+                        next.checkpoint.volume_serial,
+                        None,
+                        Some(&next.links),
+                        &cancelled,
+                        |_| {},
+                    )?;
+                    let aliases = alias_count(&links);
+                    (links, aliases)
+                }
+            };
         coverage.entries = links.len() as u64;
-        next.hard_link_aliases = alias_count(&links);
-        if links != *next.links {
-            next.links = Arc::new(links);
-        }
-        changes = read_changes(reader, &mut next.checkpoint, batch_bytes, &cancelled)?;
+        next.hard_link_aliases = aliases;
+        next.links = links;
+        changes = read(&mut next.checkpoint)?;
     }
     if !changes.is_empty() {
         return Err(invalid(
             "NTFS namespace kept changing during journal replay",
         ));
+    }
+    if validate_scope {
+        tracing::info!(root = %coverage.root.display(), journal_ms = journal_time.as_millis(), "Read journal during snapshot restore");
     }
     Ok(Some((next, coverage)))
 }
@@ -296,13 +316,6 @@ fn relist_files(
         } else {
             return Ok(None);
         };
-        if coverage
-            .examples
-            .iter()
-            .any(|(skipped, _)| skipped.parent() == Some(&path))
-        {
-            return Ok(None);
-        }
         paths.push((id, Arc::<Path>::from(path)));
     }
 
@@ -323,9 +336,24 @@ fn relist_files(
         if parent_id != expected_id {
             return Ok(None);
         }
+        // Confirm previously skipped siblings using the parent listing so
+        // protected directories require no metadata access of their own.
+        let mut skipped: HashSet<_> = coverage
+            .examples
+            .iter()
+            .filter_map(|(entry, _)| {
+                (entry.parent() == Some(&path))
+                    .then(|| entry.file_name())
+                    .flatten()
+            })
+            .collect();
         list_directory(&handle, &mut buffer, |name, id, attributes| {
             check_cancelled(&cancelled)?;
-            if attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+            let is_directory = attributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+            if skipped.remove(name.as_os_str()) && !is_directory {
+                return Err(invalid("skipped entry needs full scope reconciliation"));
+            }
+            if !is_directory {
                 if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
                     || exclusions.matches(&path.join(&name), false)
                 {
@@ -339,25 +367,31 @@ fn relist_files(
             }
             Ok(())
         })?;
+        if !skipped.is_empty() {
+            return Ok(None);
+        }
     }
-    links.extend(
-        snapshot
-            .links
-            .iter()
-            .filter(|link| link.entry.is_directory || !changes.parents.contains(&link.parent_id))
-            .cloned(),
-    );
     sort_links(&mut links);
-    Ok(Some(links))
+    let mut replacements = links.into_iter().peekable();
+    let mut merged = Vec::with_capacity(snapshot.links.len());
+    for current in snapshot
+        .links
+        .iter()
+        .filter(|link| link.entry.is_directory || !changes.parents.contains(&link.parent_id))
+    {
+        while replacements.peek().is_some_and(|replacement| {
+            crate::compare_entries(&replacement.entry, &current.entry).is_le()
+        }) {
+            merged.push(replacements.next().unwrap());
+        }
+        merged.push(current.clone());
+    }
+    merged.extend(replacements);
+    Ok(Some(merged))
 }
 
 fn sort_links(links: &mut [ScopedLink]) {
-    links.sort_unstable_by(|a, b| {
-        a.entry
-            .parent
-            .cmp(&b.entry.parent)
-            .then_with(|| a.entry.name.cmp(&b.entry.name))
-    });
+    links.sort_unstable_by(|a, b| crate::compare_entries(&a.entry, &b.entry));
 }
 
 fn alias_count(links: &[ScopedLink]) -> usize {
@@ -376,10 +410,17 @@ fn project(
     coverage: &mut RootCoverage,
     volume_serial: u32,
     namespace: Option<&Namespace>,
+    previous: Option<&Arc<Vec<ScopedLink>>>,
     cancelled: impl Fn() -> bool,
     mut progress: impl FnMut(u64),
-) -> io::Result<Vec<ScopedLink>> {
+) -> io::Result<Arc<Vec<ScopedLink>>> {
     let mut links = Vec::new();
+    let mut all_reused = true;
+    let mut previous_rows: HashMap<_, _> = previous
+        .into_iter()
+        .flat_map(|links| links.iter())
+        .map(|link| ((link.id, link.parent_id), &link.entry))
+        .collect();
     let mut directory_buffer = vec![0_u64; 8192];
     let mut pending = vec![(
         Arc::<Path>::from(root),
@@ -433,7 +474,18 @@ fn project(
             }
             // The current path was resolved through a chain of verified parent
             // IDs. A file with another name or parent is a verified hard link.
-            let entry = make_entry(&parent, name, is_directory);
+            let entry = previous_rows
+                .remove(&(id, parent_id))
+                .filter(|entry| {
+                    entry.parent == parent
+                        && entry.name == name
+                        && entry.is_directory == is_directory
+                })
+                .cloned()
+                .unwrap_or_else(|| {
+                    all_reused = false;
+                    make_entry(&parent, name, is_directory)
+                });
             let link = ScopedLink {
                 id,
                 parent_id,
@@ -451,9 +503,14 @@ fn project(
             Ok(())
         })?;
     }
-    sort_links(&mut links);
     coverage.entries = links.len() as u64;
-    Ok(links)
+    if let Some(previous) = previous {
+        if all_reused && previous_rows.is_empty() && links.len() == previous.len() {
+            return Ok(previous.clone());
+        }
+    }
+    sort_links(&mut links);
+    Ok(Arc::new(links))
 }
 
 fn check_cancelled(cancelled: impl Fn() -> bool) -> io::Result<()> {

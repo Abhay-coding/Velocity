@@ -22,7 +22,7 @@ The baseline UI asks for at least two characters and debounces edits by 150 ms. 
 | M8 · Folder changes | `ReadDirectoryChangesW` starts before the initial walk. Small file batches update affected entries. Overflow, directory moves, access changes and reconnects use a scoped walk. A real notification overflow converged to the expected manifest. A temporary SMB root recovered changes made while disconnected, and a separate local root stayed searchable. [Microsoft directory notification documentation](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-readdirectorychangesw) |
 | M9 · Persistence | Versioned per-volume snapshots and their journal cursors are saved together. A disposable-volume run verified restart, offline edits, an interrupted save, access and exclusion changes, journal wrap, corruption, and a different volume at the original drive letter. A healthy volume remained searchable during recovery. |
 | M10 · Desktop controls | The unelevated Windows desktop run covered Retry, Pause, Resume, Reindex, navigation, page filters, file and folder opening, and rapid typing. Escape and closing the window hid the app. The native tray commands reopened it and quit it during indexing. The test verified Windows hotkey registration and message handling. Keyboard delivery of the global shortcut remains unverified in this session. |
-| M11 · Release performance | Both corpus sizes were exercised. See the benchmark results below for the budgets and the remaining measurements. |
+| M11 · Release performance | The 26 November release runs covered both corpus sizes and met the measured budgets after tuning NTFS updates and restore. At one million entries, the final NTFS run measured 36.35 ms for the slowest query p95, 228.12 ms for the slowest change p95, and 2.996 s for warm restart. Desktop live first paint was 203.22 ms p95 with zero stale frames. Full path comparisons matched exactly. |
 | M12 · Standalone release | Native folder search is the default. Everything is available with the `everything` Cargo feature and a matching configuration setting. The default dependency graph and ZIP contents were inspected. Clean-VM installation and release sign-off remain open. |
 
 The native syntax covers the fixture and the desktop's advertised filename and extension queries. Review saved searches that use OR, NOT, grouping, wildcards, macros, case or regex modifiers, extension lists, content or property predicates before migrating them. Unsupported expressions produce an error. [Everything search syntax](https://www.voidtools.com/support/everything/search_syntax/)
@@ -131,6 +131,10 @@ Both `Ctrl+Shift+F9` and `Alt+Space` registered with Windows. The automated run 
 
 ## Release benchmark
 
+The current benchmark uses one generated corpus per size for both providers and the desktop. On Windows, run `./tools/release-search-benchmark.ps1` from an elevated PowerShell to measure folder and NTFS indexing on verified disposable volumes. Run `./tools/release-search-benchmark.ps1 -FolderOnly` under standard permissions to measure folder search on the host drive. The runner writes raw results under `target/m11-results-*`. [26 November 2026 release benchmark](benchmarks/2026-11-26-release-search.md)
+
+### 20 November 2026 folder baseline
+
 Run from the repository root on Windows. Use a writable local volume with room for the disposable corpus.
 
 ```powershell
@@ -159,6 +163,6 @@ Reference host used on 20 November 2026, India time. Windows 26H2 build `26300.9
 | Peak working set through initial build | 40.6 MiB | 351.4 MiB |
 | Private bytes after initial build | 38.4 MiB | 358.9 MiB |
 
-All six provider query classes met the 50 ms p95 target at one million entries. The sampled ordinary file changes met the 1 second target. Both full-corpus comparisons found zero missing, stale, duplicate or out-of-scope paths after catch-up. The initial runs that rescanned whole roots after every notification took several seconds to show file changes at one million entries. The final run uses bounded file updates and falls back to a scoped walk for directory or access changes. The full desktop first-paint benchmark at the release corpus sizes, privileged NTFS timings, persisted snapshot size and load time, and an Everything timing comparison remain open.
+All six provider query classes met the 50 ms p95 target at one million entries. The sampled ordinary file changes met the 1 second target. Both full-corpus comparisons found zero missing, stale, duplicate or out-of-scope paths after catch-up. The initial runs that rescanned whole roots after every notification took several seconds to show file changes at one million entries. The final run used bounded file updates and fell back to a scoped walk for directory or access changes.
 
 [Raw 100,000-entry measurements](benchmarks/2026-11-20-folder-100000.txt) · [Raw 1,000,000-entry measurements](benchmarks/2026-11-20-folder-1000000.txt)

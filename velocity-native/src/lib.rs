@@ -163,7 +163,7 @@ pub struct FolderProvider {
     stopped: tokio::sync::Notify,
     ntfs_batch_bytes: Option<usize>,
     #[cfg(windows)]
-    snapshot_cache: Option<PathBuf>,
+    snapshot_cache: Option<Arc<ntfs::disk::Cache>>,
 }
 
 impl FolderProvider {
@@ -223,7 +223,7 @@ impl FolderProvider {
     pub fn with_snapshot_cache(mut self, directory: PathBuf) -> Self {
         if directory.is_absolute() && directory.parent().is_some() {
             Arc::make_mut(&mut self.exclusions).exclude_cache(&directory);
-            self.snapshot_cache = Some(directory);
+            self.snapshot_cache = Some(Arc::new(ntfs::disk::Cache::new(directory)));
         }
         self
     }
@@ -298,10 +298,9 @@ impl FolderProvider {
                 if coverage.iter().all(|root| root.state == RootState::Scanning) {
                     for (index, root) in roots.iter().enumerate() {
                         if cancelled() { break; }
-                        match ntfs::disk::restore(cache, root, &exclusions, batch_bytes, &restored, cancelled) {
+                        match ntfs::disk::restore(&cache.directory, root, &exclusions, batch_bytes, &restored, cancelled) {
                             Ok(Some((projected, needs_save))) => {
-                                let mut found: Vec<_> = projected.ntfs.as_ref().unwrap().entries().collect();
-                                found.sort_unstable_by(compare_entries);
+                                let found: Vec<_> = projected.ntfs.as_ref().unwrap().entries().collect();
                                 by_root[index] = Arc::new(found);
                                 restored.extend(projected.canonical.iter().cloned());
                                 coverage[index] = projected;
@@ -353,8 +352,7 @@ impl FolderProvider {
                                 if let Some((next, mut projected)) = updated {
                                     if !next.same_projection(snapshot) {
                                         save.insert(index);
-                                        let mut found: Vec<_> = next.entries().collect();
-                                        found.sort_unstable_by(compare_entries);
+                                        let found: Vec<_> = next.entries().collect();
                                         if *by_root[index] != found {
                                             by_root[index] = Arc::new(found);
                                             changed = true;
@@ -384,7 +382,7 @@ impl FolderProvider {
                             index == other_index || (!root.starts_with(other) && !other.starts_with(root)
                                 && coverage[other_index].state != RootState::Skipped)
                         });
-                        if folder_source && independent && coverage[index].state == RootState::Ready && coverage[index].skipped == 0 {
+                        if folder_source && independent && coverage[index].state == RootState::Ready && folder::untouched_skips(&coverage[index], paths) {
                             if let Some(found) = folder::reconcile_files(root, &exclusions, &by_root[index], paths, cancelled) {
                                 if let Some(path) = &coverage[index].canonical { visited.insert(path.clone()); }
                                 coverage[index].entries = found.len() as u64;
@@ -420,23 +418,28 @@ impl FolderProvider {
                 }
                 #[cfg(windows)]
                 if coverage[index].ntfs.is_some() { save.insert(index); }
-                found.sort_unstable_by(compare_entries);
+                #[cfg(windows)]
+                let already_sorted = coverage[index].ntfs.is_some();
+                #[cfg(not(windows))]
+                let already_sorted = false;
+                if !already_sorted { found.sort_unstable_by(compare_entries); }
                 if *by_root[index] != found {
                     by_root[index] = Arc::new(found);
                     changed = true;
                 }
             }
             #[cfg(windows)]
-            let cache_writes = snapshot_cache.as_deref().map(|cache| {
-                (cache, save.into_iter().map(|index| coverage[index].clone()).collect::<Vec<_>>())
+            let cache_writes = snapshot_cache.as_ref().map(|_| {
+                save.into_iter().map(|index| coverage[index].clone()).collect::<Vec<_>>()
             });
             publish(&state, coverage, by_root, changed, dirty.is_none(), cancelled, started);
             #[cfg(windows)]
-            if let Some((cache, roots)) = cache_writes {
-                for root in roots {
-                    if cancelled() { break; }
-                    if let Err(error) = ntfs::disk::save(cache, &root, &exclusions) {
-                        debug!(root = %root.root.display(), %error, "Could not save NTFS snapshot");
+            if !cancelled() {
+                if let (Some(cache), Some(roots)) = (snapshot_cache, cache_writes) {
+                    if dirty.is_some() {
+                        cache.schedule(roots, exclusions);
+                    } else {
+                        cache.save_now(roots, &exclusions);
                     }
                 }
             }
@@ -632,6 +635,10 @@ impl IndexProvider for FolderProvider {
 
     async fn shutdown(&self) -> VelocityResult<()> {
         self.stop.store(true, Ordering::Release);
+        #[cfg(windows)]
+        if let Some(cache) = &self.snapshot_cache {
+            cache.cancel_pending();
+        }
         self.stopped.notify_one();
         Ok(())
     }

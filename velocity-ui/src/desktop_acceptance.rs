@@ -121,6 +121,7 @@ pub(crate) struct Run {
     native: Arc<FolderProvider>,
     trials: usize,
     observation: Mutex<Observation>,
+    benchmark_root: Option<PathBuf>,
 }
 
 impl Run {
@@ -146,6 +147,7 @@ impl Run {
             native,
             trials,
             observation: Mutex::default(),
+            benchmark_root: std::env::var_os("VELOCITY_TYPING_BENCHMARK_ROOT").map(PathBuf::from),
         })))
     }
 
@@ -211,6 +213,9 @@ impl Run {
             return Err(failure(
                 "The fixture must contain more than 100 report files",
             ));
+        }
+        if let Some(root) = self.benchmark_root.clone() {
+            return self.benchmark_paint(ui, root).await;
         }
         let mut latencies = Vec::with_capacity(self.trials);
         for trial in 1..=self.trials {
@@ -283,6 +288,99 @@ impl Run {
             latencies[self.trials.div_ceil(2) - 1],
             latencies[(self.trials * 95).div_ceil(100) - 1]
         );
+        Ok(())
+    }
+
+    async fn benchmark_paint(
+        self: Arc<Self>,
+        ui: &Weak<SearchBar>,
+        root: PathBuf,
+    ) -> VelocityResult<()> {
+        for mode in ["idle", "live"] {
+            let mut values = Vec::with_capacity(self.trials);
+            for trial in 1..=self.trials {
+                on_ui(ui, |ui| {
+                    ui.invoke_focus_search();
+                    for _ in 0..PREFIX.len() + SUFFIX.len() {
+                        key(&ui, Key::Backspace);
+                    }
+                    for ch in PREFIX.chars() {
+                        key(&ui, ch);
+                    }
+                })
+                .await?;
+                let revision = self.native.status().revision;
+                let workload = (mode == "live").then(|| {
+                    let file = root.join(format!(
+                        "velocity-m11-{}-{trial:02}.tmp",
+                        std::process::id()
+                    ));
+                    tokio::spawn(async move {
+                        for _ in 0..4 {
+                            drop(fs::File::create_new(&file)?);
+                            sleep(Duration::from_millis(90)).await;
+                            fs::remove_file(&file)?;
+                            sleep(Duration::from_millis(90)).await;
+                        }
+                        Ok::<_, std::io::Error>(())
+                    })
+                });
+                sleep(Duration::from_millis(35)).await;
+                let run = self.clone();
+                let generation = on_ui(ui, move |ui| {
+                    let (last, prefix) = SUFFIX.as_bytes().split_last().unwrap();
+                    for &ch in prefix {
+                        key(&ui, char::from(ch));
+                    }
+                    run.observation.lock().unwrap().started = Some(Instant::now());
+                    key(&ui, char::from(*last));
+                    ui.get_search_generation()
+                })
+                .await?;
+                wait_for("the benchmark page to paint", || {
+                    self.observation.lock().unwrap().first_frame.is_some()
+                })
+                .await?;
+                if let Some(workload) = workload {
+                    if workload.is_finished() {
+                        return Err(failure("The change burst ended before first paint"));
+                    }
+                    workload
+                        .await
+                        .map_err(|error| failure(&error.to_string()))??;
+                    wait_for("the live create/delete results to publish", || {
+                        self.native.status().revision != revision && !self.native.status().scanning
+                    })
+                    .await?;
+                    wait_for("the desktop to paint the refreshed query", || {
+                        self.observation
+                            .lock()
+                            .unwrap()
+                            .painted_generation
+                            .is_some_and(|painted| painted != generation)
+                    })
+                    .await?;
+                } else {
+                    sleep(Duration::from_millis(65)).await;
+                }
+                let observed = std::mem::take(&mut *self.observation.lock().unwrap());
+                let (elapsed, _, metadata_unknown) = observed.first_frame.unwrap();
+                if observed.stale_frames != 0 || !metadata_unknown {
+                    return Err(failure(
+                        "An obsolete result painted or metadata was loaded eagerly",
+                    ));
+                }
+                values.push(elapsed.as_micros());
+                println!(
+                    "desktop mode={mode} trial={trial} first_paint_us={}",
+                    elapsed.as_micros()
+                );
+            }
+            let mut ordered = values.clone();
+            ordered.sort_unstable();
+            println!("desktop mode={mode} samples={} p50_us={} p95_us={} stale_frames=0 values_us={values:?}",
+                values.len(), ordered[values.len().div_ceil(2) - 1], ordered[(values.len() * 95).div_ceil(100) - 1]);
+        }
         Ok(())
     }
 }

@@ -5520,6 +5520,7 @@ dependencies = [
 name = "velocity-native"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "crc32fast",
  "glob",
  "memchr",
@@ -5527,6 +5528,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "velocity-core",
  "windows-sys 0.61.2",
 ]

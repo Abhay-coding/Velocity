@@ -2,6 +2,70 @@ use super::*;
 use crate::{FolderProvider, IndexProvider, SearchQuery};
 use std::{collections::BTreeSet, os::windows::fs::MetadataExt, process::Command, time::Duration};
 
+#[test]
+fn an_explicit_snapshot_supersedes_older_queued_writes() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "velocity-cache-order-{}-{stamp}",
+        std::process::id()
+    ));
+    fs::create_dir(&directory).unwrap();
+    let cache = Arc::new(Cache::new(directory.clone()));
+    let exclusions = Arc::new(Exclusions::new(&[]).unwrap());
+    let root = PathBuf::from(r"X:\");
+    let identity = r"\\?\Volume{00000000-0000-0000-0000-000000000001}\";
+    let coverage = |next_usn| {
+        let mut coverage = RootCoverage::new(root.clone(), RootState::Ready);
+        coverage.ntfs = Some(Arc::new(ScopedSnapshot {
+            checkpoint: Checkpoint {
+                volume_identity: identity.into(),
+                volume_serial: 7,
+                journal_id: 10,
+                next_usn,
+            },
+            enumeration_start_usn: 4,
+            enumeration_batches: 1,
+            hard_link_aliases: 0,
+            links: Arc::new(Vec::new()),
+        }));
+        coverage
+    };
+    let target = cache_file(&directory, identity).unwrap();
+    let old = SnapshotFile::new(&root, &exclusions, coverage(9).ntfs.as_deref().unwrap()).unwrap();
+    let legacy = serde_json::to_vec(&old).unwrap();
+    let mut file = File::create(&target).unwrap();
+    file.write_all(&crc32fast::hash(&legacy).to_le_bytes())
+        .unwrap();
+    file.write_all(&legacy).unwrap();
+    drop(file);
+    assert_eq!(
+        read_file(File::open(&target).unwrap())
+            .unwrap()
+            .checkpoint
+            .next_usn,
+        9
+    );
+
+    cache.schedule(vec![coverage(12)], exclusions.clone());
+    cache.schedule(vec![coverage(15)], exclusions.clone());
+    cache.save_now(vec![coverage(20)], &exclusions);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while cache.pending.lock().unwrap().worker && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!cache.pending.lock().unwrap().worker);
+    let mut file = File::open(&target).unwrap();
+    let mut magic = [0; 4];
+    file.read_exact(&mut magic).unwrap();
+    assert_eq!(magic, BINARY_MAGIC);
+    file.rewind().unwrap();
+    assert_eq!(read_file(file).unwrap().checkpoint.next_usn, 20);
+    fs::remove_dir_all(directory).unwrap();
+}
+
 fn fixture() -> (PathBuf, PathBuf, PathBuf) {
     let get = |name| PathBuf::from(std::env::var_os(name).unwrap());
     (
