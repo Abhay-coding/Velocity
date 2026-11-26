@@ -31,7 +31,7 @@ Edit `search.roots` in `target/release/config.toml` to list the absolute paths y
 .\target\release\velocity-ui.exe
 ```
 
-The app scans readable folders on startup. The bottom of the window shows which locations are ready, unavailable, or skipped. Once a folder is ready, type at least two characters to search it.
+The app scans readable folders on startup. The bottom of the window reports the indexed count, each root's active backend, and which locations are scanning, ready, unavailable, or skipped. Once a folder is ready, type at least two characters to search it.
 
 | Input | Action |
 | --- | --- |
@@ -39,15 +39,17 @@ The app scans readable folders on startup. The bottom of the window shows which 
 | ↑ / ↓, Page Up / Page Down | Move through results |
 | Enter or double-click | Open the selected result |
 | Ctrl+Enter | Open its containing folder |
-| Escape | Hide the window |
+| Escape or close window | Hide the window |
 
-Use **Show search** in the system tray to bring the window back, or **Quit Velocity Search** to exit. If a configured root is unavailable, check its path, connection and permissions, then select **Retry**. Other readable roots stay searchable.
+Use **Show search** in the system tray to bring the window back, or **Quit Velocity Search** to exit. If a configured root is unavailable, check its path, connection and permissions, then select **Retry** to recheck the affected scope. Other readable roots stay searchable.
 
 ## Configuration
 
 Put `config.toml` beside `velocity-ui.exe`. Add absolute folders under `search.roots`. You can also set `drives.drives` to a list of drive letters such as `['D:']`. Native indexing skips junctions and applies the globs in `excludes.patterns` when `excludes.enabled` is true. A glob such as `**/node_modules/**` excludes the matching subtree. `ui.max_results` controls the displayed page size and `ui.theme` controls the startup appearance. Theme changes made in the window apply to the current session.
 
 **Pause** keeps the previous snapshot searchable. **Resume** and **Reindex** scan the configured roots again. Searches use the last published snapshot during a rebuild. The current folder index rebuilds from disk at launch.
+
+Set `hotkey.key` to change the global shortcut from `Alt+Space`. Windows supports combinations such as `Ctrl+Shift+F9`. The tray can reopen search when a shortcut is unavailable.
 
 Set `search.ntfs_snapshots = true` to use NTFS snapshots for whole local drives such as `D:\`. Velocity checks directory access under the running account before adding names to search, including additional hard-link names. It reads the volume's change journal to update results as files and folders change. After a restart, it validates the saved snapshot in `%LOCALAPPDATA%\Velocity\index`, checks current directory access, and catches up from the saved journal position. A missing, damaged, or outdated snapshot triggers a rebuild. When the account cannot read the volume or its journal, Velocity uses folder indexing automatically. Folder indexing remains the default.
 

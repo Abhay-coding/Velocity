@@ -22,6 +22,9 @@ use velocity_native::FolderProvider;
 
 use crate::SearchBar;
 
+mod controls;
+pub(crate) use controls::{record_open, start_controls};
+
 const PREFIX: &str = "report";
 const SUFFIX: &str = "-needle";
 const EXPECTED: &str = "report-needle.txt";

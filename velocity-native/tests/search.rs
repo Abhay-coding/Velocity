@@ -118,6 +118,61 @@ async fn live_changes_and_reconnect_converge_independently() {
 
 #[cfg(windows)]
 #[tokio::test]
+async fn retry_keeps_an_independent_snapshot_searchable() {
+    let fixture = Fixture::new();
+    fixture.file("healthy/published-name.txt");
+    let roots = vec![fixture.0.join("healthy"), fixture.0.join("unavailable")];
+    let provider = FolderProvider::new(roots, &[]).unwrap();
+    provider.initialize().await.unwrap();
+    assert_eq!(provider.status().indexed_entries, 1);
+    assert!(provider.status().searchable);
+    fixture.file("unavailable/recovered-name.txt");
+    fs::rename(
+        fixture.0.join("healthy/published-name.txt"),
+        fixture.0.join("healthy/edited-name.txt"),
+    )
+    .unwrap();
+
+    provider.retry_unavailable().await.unwrap();
+    assert_eq!(provider.status().indexed_entries, 2);
+    assert_eq!(
+        provider
+            .search(query("recovered-name", 0, 10))
+            .await
+            .unwrap()
+            .total_count,
+        Some(1)
+    );
+    assert_eq!(
+        provider
+            .search(query("published-name", 0, 10))
+            .await
+            .unwrap()
+            .total_count,
+        Some(1)
+    );
+    assert_eq!(
+        provider
+            .search(query("edited-name", 0, 10))
+            .await
+            .unwrap()
+            .total_count,
+        Some(0)
+    );
+
+    provider.reindex().await.unwrap();
+    assert_eq!(
+        provider
+            .search(query("edited-name", 0, 10))
+            .await
+            .unwrap()
+            .total_count,
+        Some(1)
+    );
+}
+
+#[cfg(windows)]
+#[tokio::test]
 #[ignore = "uses the temporary SMB share created by tools/verify-folder-reconnect.ps1"]
 async fn network_root_reconnects_and_reconciles_downtime() {
     let stage = PathBuf::from(std::env::var_os("VELOCITY_M8_STAGE").unwrap());

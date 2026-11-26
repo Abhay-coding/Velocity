@@ -8,7 +8,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info};
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem},
-    TrayIconBuilder, TrayIconEvent,
+    ClickType, TrayIconBuilder, TrayIconEvent,
 };
 use velocity_core::{
     config::{Config, SearchBackend},
@@ -18,6 +18,8 @@ use velocity_core::{
 #[cfg(feature = "everything")]
 use velocity_everything::EverythingCliAdapter;
 use velocity_native::{FolderProvider, NativeStatus, RootState};
+
+mod hotkey;
 
 #[cfg(feature = "desktop-acceptance")]
 mod desktop_acceptance;
@@ -123,7 +125,18 @@ fn receive_page(ui: &SearchBar, state: &mut SearchState, results: VelocityResult
         Err(err) => {
             error!("Search failed: {err}");
             ui.set_failed(true);
-            ui.set_status_text(err.to_string().into());
+            let invalid_query = matches!(err, VelocityError::InvalidQuery(_));
+            ui.set_search_retry(
+                !invalid_query && (!ui.get_native_backend() || ui.get_index_needs_retry()),
+            );
+            ui.set_status_text(
+                if invalid_query {
+                    err.to_string()
+                } else {
+                    format!("{} · {err}", ui.get_backend_name())
+                }
+                .into(),
+            );
         }
     }
 }
@@ -132,12 +145,16 @@ fn coverage_text(status: &NativeStatus) -> String {
     if status.roots.is_empty() {
         return "Native folder search · Set search.roots in config.toml".into();
     }
-    let mut text = if status.paused {
-        "Native folder search · Paused"
-    } else {
-        "Native folder search"
+    let mut text = format!("Native search · {} indexed", status.indexed_entries);
+    if status.paused {
+        text.push_str(if status.searchable {
+            " · Paused · Showing last index"
+        } else {
+            " · Paused"
+        });
+    } else if status.scanning && status.searchable {
+        text.push_str(" · Updating · Showing last index");
     }
-    .to_owned();
     for root in &status.roots {
         let label = match root.state {
             RootState::Scanning => format!("scanning ({} entries)", root.entries),
@@ -151,6 +168,10 @@ fn coverage_text(status: &NativeStatus) -> String {
             text.push_str(" · NTFS snapshot");
         } else if root.state == RootState::Ready && root.detail.is_some() {
             text.push_str(" · Folder fallback");
+        } else if root.state == RootState::Ready {
+            text.push_str(" · Folder index");
+        } else if let Some(detail) = &root.detail {
+            text.push_str(&format!(" · {detail}"));
         }
         if root.skipped > 0 {
             text.push_str(&format!(" · {} skipped", root.skipped));
@@ -260,15 +281,17 @@ fn main() -> VelocityResult<()> {
         .enable_all()
         .build()?;
     let ui = SearchBar::new()?;
+    let backend = provider.capabilities().name;
     ui.set_dark(config.ui.theme != "light");
-    ui.set_hotkey_hint("Alt+Space".into());
+    ui.set_hotkey_hint(config.hotkey.hotkey_hint().into());
+    ui.set_backend_name(backend.clone().into());
     ui.set_native_backend(native.is_some());
-    ui.set_coverage(format!("{} · Starting", provider.capabilities().name).into());
+    ui.set_coverage(format!("{backend} · Starting").into());
     let state = Arc::new(Mutex::new(SearchState::default()));
 
-    if let Some(native) = &native {
+    let monitor = if let Some(native) = &native {
         let _runtime = runtime.enter();
-        native.start_monitor();
+        Some(native.start_monitor())
     } else {
         let init_provider = provider.clone();
         let weak = ui.as_weak();
@@ -279,11 +302,14 @@ fn main() -> VelocityResult<()> {
                 Err(err) => {
                     error!("Search initialization failed: {err}");
                     ui.set_failed(true);
-                    ui.set_status_text(err.to_string().into());
+                    ui.set_search_retry(true);
+                    ui.set_coverage("Everything CLI · Unavailable".into());
+                    ui.set_status_text(format!("Everything CLI · {err}").into());
                 }
             });
         });
-    }
+        None
+    };
 
     let callback_state = state.clone();
     let weak = ui.as_weak();
@@ -337,6 +363,7 @@ fn main() -> VelocityResult<()> {
         ui.set_search_results(ModelRc::default());
         ui.set_result_summary("".into());
         ui.set_failed(false);
+        ui.set_search_retry(false);
         let text = text.trim();
         if text.chars().count() < 2 {
             ui.set_status_text(
@@ -402,7 +429,11 @@ fn main() -> VelocityResult<()> {
                 if ui.get_coverage() != coverage.as_str() {
                     ui.set_coverage(coverage.into());
                 }
-                ui.set_index_paused(status.paused);
+                if ui.get_index_paused() != status.paused {
+                    ui.set_index_paused(status.paused);
+                    ui.set_pause_command_pending(false);
+                }
+                ui.set_index_scanning(status.scanning);
                 ui.set_index_needs_retry(status.roots.iter().any(|root| {
                     matches!(root.state, RootState::AccessDenied | RootState::Unavailable)
                 }));
@@ -423,27 +454,53 @@ fn main() -> VelocityResult<()> {
     let weak = ui.as_weak();
     let handle = runtime.handle().clone();
     let retry_provider = provider.clone();
+    let retry_native = native.clone();
     ui.on_retry_requested(move || {
-        if let Some(ui) = weak.upgrade() {
-            if ui.get_native_backend() {
-                let provider = retry_provider.clone();
-                handle.spawn(async move {
-                    if let Err(err) = provider.reindex().await {
-                        error!(%err, "Reindex failed");
-                    }
-                });
-            } else {
-                ui.invoke_refresh_search();
-            }
+        let Some(ui) = weak.upgrade() else { return };
+        if ui.get_index_paused() || ui.get_index_scanning() || ui.get_index_command_pending() {
+            return;
         }
+        let retry = ui.get_index_needs_retry();
+        let (provider, native, weak) = (retry_provider.clone(), retry_native.clone(), weak.clone());
+        ui.set_index_command_pending(true);
+        ui.set_index_message("".into());
+        handle.spawn(async move {
+            let result = match &native {
+                Some(native) if retry => native.retry_unavailable().await,
+                Some(_) => provider.reindex().await,
+                None => provider.initialize().await,
+            };
+            let _ = weak.upgrade_in_event_loop(move |ui| {
+                ui.set_index_command_pending(false);
+                match result {
+                    Err(error) => {
+                        error!(%error, "Index action failed");
+                        ui.set_index_message(format!("{} · {error}", ui.get_backend_name()).into());
+                    }
+                    Ok(()) if native.is_none() => {
+                        ui.set_coverage("Everything CLI · Connected".into());
+                        ui.set_failed(false);
+                        ui.set_search_retry(false);
+                        ui.set_status_text("".into());
+                        ui.invoke_refresh_search();
+                    }
+                    Ok(()) => {}
+                }
+            });
+        });
     });
     let weak = ui.as_weak();
     let handle = runtime.handle().clone();
     let pause_provider = provider.clone();
     ui.on_pause_requested(move || {
         let Some(ui) = weak.upgrade() else { return };
+        if ui.get_pause_command_pending() {
+            return;
+        }
         let was_paused = ui.get_index_paused();
-        let provider = pause_provider.clone();
+        let (provider, weak) = (pause_provider.clone(), weak.clone());
+        ui.set_pause_command_pending(true);
+        ui.set_index_message("".into());
         handle.spawn(async move {
             let result = if was_paused {
                 provider.resume_indexing().await
@@ -452,6 +509,10 @@ fn main() -> VelocityResult<()> {
             };
             if let Err(err) = result {
                 error!(%err, "Could not change indexing state");
+                let _ = weak.upgrade_in_event_loop(move |ui| {
+                    ui.set_pause_command_pending(false);
+                    ui.set_index_message(format!("{} · {err}", ui.get_backend_name()).into());
+                });
             }
         });
     });
@@ -477,8 +538,13 @@ fn main() -> VelocityResult<()> {
                 } else {
                     &path
                 };
-                if let Err(err) = open_path(target) {
-                    ui.set_status_text(err.into());
+                match open_path(target) {
+                    Ok(()) => {
+                        debug!(path = %target.display(), "Opened search result");
+                        #[cfg(feature = "desktop-acceptance")]
+                        desktop_acceptance::record_open(target);
+                    }
+                    Err(err) => ui.set_status_text(err.into()),
                 }
             }
         };
@@ -539,6 +605,8 @@ fn main() -> VelocityResult<()> {
             let _ = ui.hide();
         }
     });
+    ui.window()
+        .on_close_requested(|| slint::CloseRequestResponse::HideWindow);
 
     let menu = Menu::new();
     let show = MenuItem::new("Show search", true, None);
@@ -565,54 +633,37 @@ fn main() -> VelocityResult<()> {
     let _tray = TrayIconBuilder::new()
         .with_icon(icon)
         .with_tooltip("Velocity Search")
-        .with_menu(Box::new(menu))
+        .with_menu(Box::new(menu.clone()))
         .build()
         .map_err(|err| VelocityError::Config(err.to_string()))?;
 
     let weak = ui.as_weak();
     let (show_id, theme_id, quit_id) = (show.id().clone(), theme.id().clone(), quit.id().clone());
-    std::thread::spawn(move || {
-        while let Ok(event) = MenuEvent::receiver().recv() {
-            if event.id == quit_id {
-                let _ = slint::invoke_from_event_loop(|| {
-                    let _ = slint::quit_event_loop();
-                });
-                break;
-            }
-            if event.id == show_id {
-                let _ = weak.upgrade_in_event_loop(show_window);
-            } else if event.id == theme_id {
-                let _ = weak.upgrade_in_event_loop(|ui| ui.set_dark(!ui.get_dark()));
-            }
+    MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+        if event.id == quit_id {
+            let _ = slint::invoke_from_event_loop(|| {
+                let _ = slint::quit_event_loop();
+            });
+        } else if event.id == show_id {
+            let _ = weak.upgrade_in_event_loop(show_window);
+        } else if event.id == theme_id {
+            let _ = weak.upgrade_in_event_loop(|ui| ui.set_dark(!ui.get_dark()));
         }
-    });
+    }));
     let weak = ui.as_weak();
-    std::thread::spawn(move || {
-        while let Ok(event) = TrayIconEvent::receiver().recv() {
-            if format!("{event:?}").contains("DoubleClick") {
-                let _ = weak.upgrade_in_event_loop(show_window);
-            }
+    TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
+        if matches!(event.click_type, ClickType::Left | ClickType::Double) {
+            let _ = weak.upgrade_in_event_loop(show_window);
         }
-    });
+    }));
     let weak = ui.as_weak();
-    std::thread::spawn(move || {
-        use rdev::{listen, EventType, Key};
-        let (mut alt, mut space) = (false, false);
-        if let Err(err) = listen(move |event| match event.event_type {
-            EventType::KeyPress(Key::Alt) => alt = true,
-            EventType::KeyRelease(Key::Alt) => alt = false,
-            EventType::KeyPress(Key::Space) => {
-                if alt && !space {
-                    let _ = weak.upgrade_in_event_loop(show_window);
-                }
-                space = true;
-            }
-            EventType::KeyRelease(Key::Space) => space = false,
-            _ => {}
-        }) {
-            error!("Global hotkey unavailable: {err:?}");
-        }
+    let hotkey = hotkey::Registration::register(config.hotkey.hotkey_hint(), move || {
+        let _ = weak.upgrade_in_event_loop(show_window);
     });
+    if let Err(error) = &hotkey {
+        error!(%error, "Global hotkey unavailable");
+        ui.set_hotkey_hint("Shortcut unavailable".into());
+    }
 
     info!("Starting Velocity Search");
     ui.show()?;
@@ -620,8 +671,30 @@ fn main() -> VelocityResult<()> {
     let acceptance_job = acceptance
         .map(|run| run.start(&ui, &runtime))
         .or_else(|| desktop_acceptance::start_ntfs(&ui, &runtime));
+    #[cfg(feature = "desktop-acceptance")]
+    let acceptance_job = match acceptance_job {
+        Some(job) => Some(job),
+        None => desktop_acceptance::start_controls(
+            &ui,
+            &runtime,
+            native.as_ref(),
+            &menu,
+            hotkey.as_ref().ok(),
+        )?,
+    };
     slint::run_event_loop_until_quit()?;
     runtime.block_on(provider.shutdown())?;
+    drop(hotkey);
+    if let Some(mut monitor) = monitor {
+        runtime.block_on(async {
+            if tokio::time::timeout(Duration::from_millis(750), &mut monitor)
+                .await
+                .is_err()
+            {
+                monitor.abort();
+            }
+        });
+    }
     #[cfg(feature = "desktop-acceptance")]
     if let Some(job) = acceptance_job {
         runtime
@@ -635,6 +708,22 @@ fn main() -> VelocityResult<()> {
 fn show_window(ui: SearchBar) {
     if let Err(err) = ui.show() {
         error!("Could not show window: {err}");
+    }
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE,
+    };
+    if let Ok(handle) = ui.window().window_handle().window_handle() {
+        if let RawWindowHandle::Win32(handle) = handle.as_raw() {
+            let hwnd = handle.hwnd.get() as _;
+            // Windows applies its normal foreground policy to this request.
+            unsafe {
+                if IsIconic(hwnd) != 0 {
+                    ShowWindow(hwnd, SW_RESTORE);
+                }
+                SetForegroundWindow(hwnd);
+            }
+        }
     }
     ui.invoke_focus_search();
 }

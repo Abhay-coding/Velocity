@@ -21,7 +21,7 @@ The baseline UI asks for at least two characters and debounces edits by 150 ms. 
 | M7 · NTFS journal | Replay catches up from the initial scan position and tails the journal while search is open. The Windows acceptance suite compares live changes with independent walks and checks that the open desktop query refreshes after directory and file renames. |
 | M8 · Folder changes | `ReadDirectoryChangesW` starts before the initial walk. Small file batches update affected entries. Overflow, directory moves, access changes and reconnects use a scoped walk. A real notification overflow converged to the expected manifest. A temporary SMB root recovered changes made while disconnected, and a separate local root stayed searchable. [Microsoft directory notification documentation](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-readdirectorychangesw) |
 | M9 · Persistence | Versioned per-volume snapshots and their journal cursors are saved together. A disposable-volume run verified restart, offline edits, an interrupted save, access and exclusion changes, journal wrap, corruption, and a different volume at the original drive letter. A healthy volume remained searchable during recovery. |
-| M10 · Desktop controls | The desktop smoke opened the correct Unicode file and observed the active query refresh and an unavailable root becoming ready. Provider tests cover pause, resume, and monitor shutdown. The full keyboard, tray, hotkey and Retry acceptance run remains open. |
+| M10 · Desktop controls | The unelevated Windows desktop run covered Retry, Pause, Resume, Reindex, navigation, page filters, file and folder opening, and rapid typing. Escape and closing the window hid the app. The native tray commands reopened it and quit it during indexing. The test verified Windows hotkey registration and message handling. Keyboard delivery of the global shortcut remains unverified in this session. |
 | M11 · Release performance | Both corpus sizes were exercised. See the benchmark results below for the budgets and the remaining measurements. |
 | M12 · Standalone release | Native folder search is the default. Everything is available with the `everything` Cargo feature and a matching configuration setting. The default dependency graph and ZIP contents were inspected. Clean-VM installation and release sign-off remain open. |
 
@@ -115,6 +115,19 @@ Run from the repository root in elevated Windows PowerShell. The runner creates 
 On 26 November 2026, each recovered index matched an independent directory walk, including its exact count. A child process exited after flushing a temporary save and before replacing the committed file. Restart kept the old file and replayed offline edits. A real NTFS journal wrap moved the first readable USN to 19,922,944, past the saved cursor of 29,744. Tests also rejected a mismatched journal ID and a damaged checksum. The healthy volume returned results while the damaged volume was still rebuilding. A third disk mounted at the original drive letter built its own snapshot under its distinct volume identity. [Microsoft journal capacity and trimming documentation](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/fsutil-usn)
 
 Cache restores check the current directory visibility before serving results, including when the journal has no new records. Restore performance at the release corpus sizes remains part of M11.
+
+## M10 desktop controls and error recovery acceptance
+
+Run from the repository root in a regular Windows desktop session using standard permissions. The runner builds the desktop acceptance binary, creates synthetic files under `target`, and removes the fixture after the app exits.
+
+```powershell
+./tools/verify-desktop-controls.ps1
+./tools/verify-desktop-controls.ps1 -DefaultHotkey
+```
+
+On 26 November 2026, Retry recovered a missing root and a separate provider test confirmed the healthy root's published entries stayed searchable. Pause retained the previous results. Resume refreshed the active query and found a file renamed during the pause. Reindex published a new revision. The keyboard and page-filter checks preserved result selection and opened the intended Unicode file, its containing folder, and a folder result through Windows Shell. The final narrow edit returned the expected row during rapid typing. Escape and closing the window hid the app, and Windows tray menu commands showed search, toggled the theme, and exited during an active rebuild.
+
+Both `Ctrl+Shift+F9` and `Alt+Space` registered with Windows. The automated run posted the corresponding `WM_HOTKEY` message to the registered worker and confirmed that search reopened. Synthetic keyboard input did not deliver that message in this session. Add `-PhysicalHotkey` on an interactive desktop that accepts synthetic input to test the full keystroke path. [Microsoft hotkey registration documentation](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-registerhotkey)
 
 ## Release benchmark
 

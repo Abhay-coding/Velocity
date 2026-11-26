@@ -138,6 +138,8 @@ pub struct NativeStatus {
     pub revision: u64,
     pub scanning: bool,
     pub paused: bool,
+    pub searchable: bool,
+    pub indexed_entries: usize,
     pub roots: Vec<RootCoverage>,
 }
 
@@ -148,7 +150,6 @@ struct State {
     by_root: Vec<Arc<Vec<Arc<Entry>>>>,
     published_roots: Vec<RootCoverage>,
     last_updated: Option<u64>,
-    searchable: bool,
 }
 
 pub struct FolderProvider {
@@ -229,6 +230,25 @@ impl FolderProvider {
 
     pub fn status(&self) -> NativeStatus {
         self.state.read().unwrap().status.clone()
+    }
+
+    /// Recheck unavailable roots and their overlapping scope.
+    pub async fn retry_unavailable(&self) -> VelocityResult<()> {
+        let pending = self
+            .state
+            .read()
+            .unwrap()
+            .published_roots
+            .iter()
+            .map(|root| match root.state {
+                RootState::AccessDenied | RootState::Unavailable => Pending::Scan,
+                _ => Pending::Clean,
+            })
+            .collect::<Vec<_>>();
+        if pending.iter().any(|root| matches!(root, Pending::Scan)) {
+            self.rebuild_roots(Some(pending), false).await?;
+        }
+        Ok(())
     }
 
     pub fn start_monitor(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
@@ -462,7 +482,7 @@ fn publish(
         .zip(&coverage)
         .any(|(previous, next)| !previous.same_coverage(next));
     state.status.roots = coverage.clone();
-    state.searchable = coverage.iter().any(|root| root.state == RootState::Ready);
+    state.status.searchable = coverage.iter().any(|root| root.state == RootState::Ready);
     state.published_roots = coverage;
     let previous_snapshots = merged.map(|entries| {
         (
@@ -470,6 +490,7 @@ fn publish(
             std::mem::replace(&mut state.entries, entries),
         )
     });
+    state.status.indexed_entries = state.entries.len();
     if force_revision || changed || coverage_changed {
         info!(
             entries = state.entries.len(),
@@ -505,7 +526,7 @@ impl IndexProvider for FolderProvider {
         let terms = Term::parse(&query.text)?;
         let entries = {
             let state = self.state.read().unwrap();
-            if !state.searchable {
+            if !state.status.searchable {
                 return Err(VelocityError::IndexProvider(if state.status.scanning {
                     "Scanning folders. Results will appear when a snapshot is ready.".into()
                 } else {

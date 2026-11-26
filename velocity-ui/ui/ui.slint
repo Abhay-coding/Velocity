@@ -43,11 +43,17 @@ export component SearchBar inherits Window {
     in property <bool> searching;
     in property <int> search-generation;
     in property <bool> failed;
+    in property <bool> search-retry;
     in property <string> status-text;
     in property <string> coverage;
     in property <bool> native-backend;
+    in property <string> backend-name;
     in property <bool> index-paused;
     in property <bool> index-needs-retry;
+    in property <bool> index-scanning;
+    in property <bool> index-command-pending;
+    in property <bool> pause-command-pending;
+    in property <string> index-message;
     in property <string> result-summary;
     in property <int> result-filter;
     property <string> query;
@@ -58,7 +64,7 @@ export component SearchBar inherits Window {
     changed width => { wide = self.width >= 780px; }
     changed height => { show-shortcuts = self.height >= 470px; }
     property <bool> has-selection: selected >= 0 && selected < search-results.length;
-    property <SearchResultItem> detail: has-selection ? search-results[selected] : {id: -1, name: "", path: "", location: "", size: "", modified: "", is_directory: false};
+    out property <SearchResultItem> detail: has-selection ? search-results[selected] : {id: -1, name: "", path: "", location: "", size: "", modified: "", is_directory: false};
 
     property <color> canvas: dark ? #101522 : #f0f3f9;
     property <color> surface: dark ? #171e2e : #ffffff;
@@ -128,9 +134,9 @@ export component SearchBar inherits Window {
                 }
                 Text { text: "Velocity Search"; color: ink; font-size: 22px; font-weight: 650; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
                 if wide: Rectangle {
-                    width: 82px; height: 28px;
+                    width: max(82px, shortcut.preferred-width + 16px); height: 28px;
                     border-radius: 6px; border-width: 1px; border-color: line; background: surface;
-                    Text { text: hotkey-hint; color: muted; font-size: 12px; horizontal-alignment: center; vertical-alignment: center; }
+                    shortcut := Text { text: hotkey-hint; color: muted; font-size: 12px; horizontal-alignment: center; vertical-alignment: center; }
                 }
                 Button { text: dark ? "Light mode" : "Dark mode"; clicked => { dark = !dark; input.focus(); } }
             }
@@ -181,7 +187,7 @@ export component SearchBar inherits Window {
                                     if has-selection {
                                         if event.modifiers.control { result-opened-folder(detail.id); }
                                         else { result-opened(detail.id); }
-                                    } else if failed { retry-requested(); }
+                                    } else if search-retry && !index-paused && !index-scanning && !index-command-pending { retry-requested(); }
                                     return accept;
                                 }
                                 return reject;
@@ -264,9 +270,9 @@ export component SearchBar inherits Window {
                                 result-filter != 0 ? "Try the All filter or change your search." : "Try a different name or file extension.";
                             color: muted; font-size: 13px; horizontal-alignment: center; wrap: word-wrap;
                         }
-                        if failed: HorizontalLayout {
+                        if search-retry: HorizontalLayout {
                             alignment: center;
-                            Button { text: "Retry"; clicked => { retry-requested(); input.focus(); } }
+                            Button { text: "Retry"; enabled: !index-paused && !index-scanning && !index-command-pending; clicked => { retry-requested(); input.focus(); } }
                         }
                     }
                 }
@@ -310,11 +316,12 @@ export component SearchBar inherits Window {
             }
 
             if coverage != "": Rectangle { height: 1px; background: line; }
+            if index-message != "": Text { text: index-message; color: danger; font-size: 12px; wrap: word-wrap; }
             if coverage != "": HorizontalLayout {
                 spacing: 8px;
                 Text { text: coverage; color: muted; font-size: 12px; wrap: word-wrap; horizontal-stretch: 1; vertical-alignment: center; }
-                if native-backend: Button { text: index-paused ? "Resume" : "Pause"; clicked => { pause-requested(); input.focus(); } }
-                if native-backend: Button { text: index-needs-retry ? "Retry" : "Reindex"; enabled: !index-paused; clicked => { retry-requested(); input.focus(); } }
+                if native-backend: Button { text: index-paused ? "Resume" : "Pause"; enabled: !pause-command-pending; clicked => { pause-requested(); input.focus(); } }
+                if native-backend: Button { text: index-needs-retry ? "Retry" : "Reindex"; enabled: !index-paused && !index-scanning && !index-command-pending; clicked => { retry-requested(); input.focus(); } }
             }
 
         }
