@@ -77,6 +77,8 @@ pub struct RootCoverage {
     pub volume: Option<Volume>,
     #[cfg(windows)]
     pub ntfs: Option<Arc<ntfs::ScopedSnapshot>>,
+    #[cfg(windows)]
+    pub ntfs_restored: bool,
     canonical: Option<PathBuf>,
 }
 
@@ -100,6 +102,8 @@ impl RootCoverage {
             volume: None,
             #[cfg(windows)]
             ntfs: None,
+            #[cfg(windows)]
+            ntfs_restored: false,
             canonical: None,
         }
     }
@@ -157,6 +161,8 @@ pub struct FolderProvider {
     rebuild: Arc<tokio::sync::Mutex<()>>,
     stopped: tokio::sync::Notify,
     ntfs_batch_bytes: Option<usize>,
+    #[cfg(windows)]
+    snapshot_cache: Option<PathBuf>,
 }
 
 impl FolderProvider {
@@ -198,6 +204,8 @@ impl FolderProvider {
             rebuild: Arc::default(),
             stopped: tokio::sync::Notify::new(),
             ntfs_batch_bytes: None,
+            #[cfg(windows)]
+            snapshot_cache: None,
         })
     }
 
@@ -209,6 +217,16 @@ impl FolderProvider {
         self
     }
 
+    /// Save and restore NTFS snapshots in a private per-user directory.
+    #[cfg(windows)]
+    pub fn with_snapshot_cache(mut self, directory: PathBuf) -> Self {
+        if directory.is_absolute() && directory.parent().is_some() {
+            Arc::make_mut(&mut self.exclusions).exclude_cache(&directory);
+            self.snapshot_cache = Some(directory);
+        }
+        self
+    }
+
     pub fn status(&self) -> NativeStatus {
         self.state.read().unwrap().status.clone()
     }
@@ -217,7 +235,11 @@ impl FolderProvider {
         tokio::spawn(monitor::monitor(self.clone()))
     }
 
-    async fn rebuild_roots(&self, dirty: Option<Vec<Pending>>) -> VelocityResult<()> {
+    async fn rebuild_roots(
+        &self,
+        dirty: Option<Vec<Pending>>,
+        #[cfg_attr(not(windows), allow(unused_variables))] startup: bool,
+    ) -> VelocityResult<()> {
         let guard = self.rebuild.clone().lock_owned().await;
         if self.stop.load(Ordering::Acquire) || self.paused.load(Ordering::Acquire) {
             return Ok(());
@@ -231,6 +253,8 @@ impl FolderProvider {
         );
         let starting_epoch = epoch.load(Ordering::Acquire);
         let ntfs_batch_bytes = self.ntfs_batch_bytes;
+        #[cfg(windows)]
+        let snapshot_cache = self.snapshot_cache.clone();
         tokio::task::spawn_blocking(move || {
             let _guard = guard;
             let cancelled =
@@ -244,9 +268,45 @@ impl FolderProvider {
             let mut changed = false;
             #[cfg(windows)]
             let mut failed_journal_roots = Vec::<&Path>::new();
+            #[cfg(windows)]
+            let mut save = HashSet::new();
+            #[cfg(windows)]
+            let mut restored_indices = HashSet::new();
+            #[cfg(windows)]
+            if let (true, Some(cache), Some(batch_bytes)) = (startup, snapshot_cache.as_deref(), ntfs_batch_bytes) {
+                let mut restored = HashSet::new();
+                if coverage.iter().all(|root| root.state == RootState::Scanning) {
+                    for (index, root) in roots.iter().enumerate() {
+                        if cancelled() { break; }
+                        match ntfs::disk::restore(cache, root, &exclusions, batch_bytes, &restored, cancelled) {
+                            Ok(Some((projected, needs_save))) => {
+                                let mut found: Vec<_> = projected.ntfs.as_ref().unwrap().entries().collect();
+                                found.sort_unstable_by(compare_entries);
+                                by_root[index] = Arc::new(found);
+                                restored.extend(projected.canonical.iter().cloned());
+                                coverage[index] = projected;
+                                restored_indices.insert(index);
+                                if needs_save { save.insert(index); }
+                            }
+                            Ok(None) => {}
+                            Err(error) => debug!(root = %root.display(), %error, "Could not restore NTFS snapshot"),
+                        }
+                    }
+                }
+                if !restored.is_empty() && !cancelled() {
+                    // A valid volume is searchable before we enumerate any
+                    // other volume whose snapshot could not be restored.
+                    publish(&state, coverage.clone(), by_root.clone(), true, true, cancelled, started);
+                }
+            }
             for (index, root) in roots.iter().enumerate() {
                 if cancelled() {
                     break;
+                }
+                #[cfg(windows)]
+                if restored_indices.contains(&index) {
+                    visited.extend(coverage[index].canonical.iter().cloned());
+                    continue;
                 }
                 if let Some(dirty) = &dirty {
                     // Rescan descendants of changed roots in case a formerly
@@ -272,6 +332,7 @@ impl FolderProvider {
                             Ok(updated) => {
                                 if let Some((next, mut projected)) = updated {
                                     if !next.same_projection(snapshot) {
+                                        save.insert(index);
                                         let mut found: Vec<_> = next.entries().collect();
                                         found.sort_unstable_by(compare_entries);
                                         if *by_root[index] != found {
@@ -337,59 +398,92 @@ impl FolderProvider {
                 if cancelled() {
                     break;
                 }
+                #[cfg(windows)]
+                if coverage[index].ntfs.is_some() { save.insert(index); }
                 found.sort_unstable_by(compare_entries);
                 if *by_root[index] != found {
                     by_root[index] = Arc::new(found);
                     changed = true;
                 }
             }
-            let merged = (changed && !cancelled()).then(|| {
-                if let [entries] = by_root.as_slice() {
-                    return entries.clone();
+            #[cfg(windows)]
+            let cache_writes = snapshot_cache.as_deref().map(|cache| {
+                (cache, save.into_iter().map(|index| coverage[index].clone()).collect::<Vec<_>>())
+            });
+            publish(&state, coverage, by_root, changed, dirty.is_none(), cancelled, started);
+            #[cfg(windows)]
+            if let Some((cache, roots)) = cache_writes {
+                for root in roots {
+                    if cancelled() { break; }
+                    if let Err(error) = ntfs::disk::save(cache, &root, &exclusions) {
+                        debug!(root = %root.root.display(), %error, "Could not save NTFS snapshot");
+                    }
                 }
-                let mut entries: Vec<_> = by_root
-                    .iter()
-                    .flat_map(|entries| entries.iter().cloned())
-                    .collect();
-                entries.sort_unstable_by(compare_entries);
-                entries.dedup();
-                Arc::new(entries)
-            });
-            let mut state = state.write().unwrap();
-            state.status.scanning = false;
-            if cancelled() {
-                state.status.roots = state.published_roots.clone();
-                return;
             }
-            let coverage_changed = state.published_roots.iter().zip(&coverage)
-                .any(|(previous, next)| !previous.same_coverage(next));
-            state.status.roots = coverage.clone();
-            state.searchable = coverage.iter().any(|root| root.state == RootState::Ready);
-            state.published_roots = coverage;
-            let previous_snapshots = merged.map(|entries| {
-                (
-                    std::mem::replace(&mut state.by_root, by_root),
-                    std::mem::replace(&mut state.entries, entries),
-                )
-            });
-            if dirty.is_none() || changed || coverage_changed {
-                info!(
-                    entries = state.entries.len(),
-                    elapsed_ms = started.elapsed().as_millis(),
-                    "Published search snapshot"
-                );
-                state.last_updated = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .ok()
-                    .map(|value| value.as_secs());
-                state.status.revision = state.status.revision.wrapping_add(1);
-            }
-            drop(state);
-            drop(previous_snapshots);
         })
         .await
         .map_err(|err| VelocityError::IndexProvider(err.to_string()))
     }
+}
+
+fn publish(
+    state: &RwLock<State>,
+    coverage: Vec<RootCoverage>,
+    by_root: Vec<Arc<Vec<Arc<Entry>>>>,
+    changed: bool,
+    force_revision: bool,
+    cancelled: impl Fn() -> bool,
+    started: Instant,
+) {
+    let merged = (changed && !cancelled()).then(|| {
+        if let [entries] = by_root.as_slice() {
+            return entries.clone();
+        }
+        let mut entries: Vec<_> = by_root
+            .iter()
+            .flat_map(|entries| entries.iter().cloned())
+            .collect();
+        entries.sort_unstable_by(compare_entries);
+        entries.dedup();
+        Arc::new(entries)
+    });
+    let mut state = state.write().unwrap();
+    let scanning = coverage
+        .iter()
+        .any(|root| root.state == RootState::Scanning);
+    state.status.scanning = scanning && !cancelled();
+    if cancelled() {
+        state.status.roots = state.published_roots.clone();
+        return;
+    }
+    let coverage_changed = state
+        .published_roots
+        .iter()
+        .zip(&coverage)
+        .any(|(previous, next)| !previous.same_coverage(next));
+    state.status.roots = coverage.clone();
+    state.searchable = coverage.iter().any(|root| root.state == RootState::Ready);
+    state.published_roots = coverage;
+    let previous_snapshots = merged.map(|entries| {
+        (
+            std::mem::replace(&mut state.by_root, by_root),
+            std::mem::replace(&mut state.entries, entries),
+        )
+    });
+    if force_revision || changed || coverage_changed {
+        info!(
+            entries = state.entries.len(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "Published search snapshot"
+        );
+        state.last_updated = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|value| value.as_secs());
+        state.status.revision = state.status.revision.wrapping_add(1);
+    }
+    drop(state);
+    drop(previous_snapshots);
 }
 
 fn compare_entries(a: &Arc<Entry>, b: &Arc<Entry>) -> std::cmp::Ordering {
@@ -403,7 +497,7 @@ fn compare_entries(a: &Arc<Entry>, b: &Arc<Entry>) -> std::cmp::Ordering {
 #[async_trait]
 impl IndexProvider for FolderProvider {
     async fn initialize(&self) -> VelocityResult<()> {
-        self.reindex().await
+        self.rebuild_roots(None, true).await
     }
 
     async fn search(&self, query: SearchQuery) -> VelocityResult<SearchResults> {
@@ -487,7 +581,7 @@ impl IndexProvider for FolderProvider {
     }
 
     async fn reindex(&self) -> VelocityResult<()> {
-        self.rebuild_roots(None).await
+        self.rebuild_roots(None, false).await
     }
 
     async fn pause_indexing(&self) -> VelocityResult<()> {

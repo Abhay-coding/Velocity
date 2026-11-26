@@ -29,6 +29,7 @@ use crate::{
 };
 
 mod snapshot;
+pub(crate) use snapshot::disk;
 pub use snapshot::ScopedSnapshot;
 pub(crate) use snapshot::{capture, tail};
 
@@ -44,7 +45,7 @@ pub struct Record {
     pub name: OsString,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Checkpoint {
     pub volume_identity: String,
     pub volume_serial: u32,

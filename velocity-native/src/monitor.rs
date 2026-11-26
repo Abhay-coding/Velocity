@@ -155,7 +155,7 @@ async fn monitor_with(provider: Arc<FolderProvider>, #[cfg(windows)] watcher: Ar
             }
         }
         if dirty.iter().any(|dirty| !matches!(dirty, Pending::Clean)) {
-            if let Err(error) = provider.rebuild_roots(Some(dirty)).await {
+            if let Err(error) = provider.rebuild_roots(Some(dirty), false).await {
                 warn!(%error, "Could not reconcile changed folders");
             }
         }

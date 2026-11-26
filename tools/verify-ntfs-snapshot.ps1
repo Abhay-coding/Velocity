@@ -1,4 +1,4 @@
-param([switch]$Journal, [switch]$Desktop)
+param([switch]$Journal, [switch]$Desktop, [switch]$Persistence)
 
 $ErrorActionPreference = 'Stop'
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -7,7 +7,7 @@ if (!$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     throw 'Run the disposable NTFS test from an elevated Windows PowerShell.'
 }
 
-function New-TestVolume([string]$Image, [string]$Label, [string]$Stage) {
+function New-TestVolume([string]$Image, [string]$Label, [string]$Stage, [string]$DriveLetter = '') {
     if (Test-Path -LiteralPath $Image) { throw 'The test image must be new.' }
     $createScript = Join-Path $Stage "$Label.diskpart.txt"
     'create vdisk file="' + $Image + '" maximum=128 type=expandable' |
@@ -25,14 +25,19 @@ function New-TestVolume([string]$Image, [string]$Label, [string]$Stage) {
         throw 'The mounted disk did not match the new disposable image.'
     }
 
-    $partition = Initialize-Disk -InputObject $disk[0] -PartitionStyle MBR -PassThru |
-        New-Partition -UseMaximumSize -AssignDriveLetter
+    $initialized = Initialize-Disk -InputObject $disk[0] -PartitionStyle MBR -PassThru
+    $partition = if ($DriveLetter) {
+        $initialized | New-Partition -UseMaximumSize -DriveLetter $DriveLetter
+    } else {
+        $initialized | New-Partition -UseMaximumSize -AssignDriveLetter
+    }
     if ($partition.DiskNumber -ne $disk[0].Number -or $partition.DriveLetter -notmatch '^[A-Z]$') {
         throw 'The new partition did not match the disposable image.'
     }
     $null = Format-Volume -Partition $partition -FileSystem NTFS -NewFileSystemLabel $Label -Confirm:$false
     $drive = "$($partition.DriveLetter):"
-    & fsutil.exe usn createjournal m=4194304 a=1048576 $drive | Out-Null
+    $bounds = if ($Persistence) { @('m=1048576', 'a=262144') } else { @('m=4194304', 'a=1048576') }
+    & fsutil.exe usn createjournal @bounds $drive | Out-Null
     if ($LASTEXITCODE) { throw 'Could not create the test volume change journal.' }
     "$drive\"
 }
@@ -103,10 +108,11 @@ try {
     $target = (Resolve-Path -LiteralPath target).Path
     $stage = Join-Path $target ('velocity-ntfs-' + [Guid]::NewGuid().ToString('N'))
     $null = New-Item -ItemType Directory -Path $stage
-    $images = @((Join-Path $stage 'scope-a.vhd'), (Join-Path $stage 'scope-b.vhd'))
+    $images = @((Join-Path $stage 'scope-a.vhd'), (Join-Path $stage 'scope-b.vhd'), (Join-Path $stage 'replacement.vhd'))
     $previousA = $env:VELOCITY_NTFS_VOLUME_A
     $previousB = $env:VELOCITY_NTFS_VOLUME_B
     $previousTrustee = $env:VELOCITY_NTFS_TRUSTEE
+    $previousCache = $env:VELOCITY_NTFS_CACHE
     try {
         $roots = @((New-TestVolume $images[0] 'VelocityM6A' $stage), (New-TestVolume $images[1] 'VelocityM6B' $stage))
         foreach ($root in $roots) { New-TestCorpus $root ('*' + $identity.User.Value) }
@@ -122,10 +128,32 @@ try {
             if ($LASTEXITCODE) { throw "NTFS catch-up acceptance exited with code $LASTEXITCODE." }
         }
         if ($Desktop) { Test-DesktopJournal $roots[1] $stage }
+        if ($Persistence) {
+            $env:VELOCITY_NTFS_TRUSTEE = '*' + $identity.User.Value
+            $env:VELOCITY_NTFS_CACHE = Join-Path $stage 'cache'
+            cargo test --locked -p velocity-native --lib persistent_snapshots_recover_against_fresh_walks -- --ignored --nocapture
+            if ($LASTEXITCODE) { throw "NTFS persistence acceptance exited with code $LASTEXITCODE." }
+            $letter = $roots[0].Substring(0, 1)
+            $original = Get-DiskImage -ImagePath $images[0]
+            $partition = Get-Partition -DriveLetter $letter
+            if (!$original.Attached -or ($original | Get-Disk).Number -ne $partition.DiskNumber) {
+                throw 'The original drive letter no longer belongs to the disposable test disk.'
+            }
+            Dismount-DiskImage -ImagePath $images[0] | Out-Null
+            if (Get-Partition -DriveLetter $letter -ErrorAction SilentlyContinue) {
+                throw 'The original test drive letter is still occupied.'
+            }
+            $replacement = New-TestVolume $images[2] 'VelocityM9C' $stage $letter
+            New-TestCorpus $replacement $env:VELOCITY_NTFS_TRUSTEE
+            [IO.File]::WriteAllText((Join-Path $replacement 'fixture/alpha/replacement-only.txt'), 'Replacement volume')
+            cargo test --locked -p velocity-native --lib replacement_volume_does_not_load_the_old_index -- --ignored --nocapture
+            if ($LASTEXITCODE) { throw "NTFS replacement acceptance exited with code $LASTEXITCODE." }
+        }
     } finally {
         $env:VELOCITY_NTFS_VOLUME_A = $previousA
         $env:VELOCITY_NTFS_VOLUME_B = $previousB
         $env:VELOCITY_NTFS_TRUSTEE = $previousTrustee
+        $env:VELOCITY_NTFS_CACHE = $previousCache
         foreach ($image in $images) {
             if (Test-Path -LiteralPath $image) {
                 $mounted = Get-DiskImage -ImagePath $image -ErrorAction SilentlyContinue

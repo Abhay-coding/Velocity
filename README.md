@@ -49,7 +49,7 @@ Put `config.toml` beside `velocity-ui.exe`. Add absolute folders under `search.r
 
 **Pause** keeps the previous snapshot searchable. **Resume** and **Reindex** scan the configured roots again. Searches use the last published snapshot during a rebuild. The current folder index rebuilds from disk at launch.
 
-Set `search.ntfs_snapshots = true` to use NTFS snapshots for whole local drives such as `D:\`. Velocity checks directory access under the running account before adding names to search, including additional hard-link names. It reads the volume's change journal to update results as files and folders change and rebuilds the snapshot if the journal position expires. When the account cannot read the volume or its journal, Velocity uses folder indexing automatically. Folder indexing remains the default.
+Set `search.ntfs_snapshots = true` to use NTFS snapshots for whole local drives such as `D:\`. Velocity checks directory access under the running account before adding names to search, including additional hard-link names. It reads the volume's change journal to update results as files and folders change. After a restart, it validates the saved snapshot in `%LOCALAPPDATA%\Velocity\index`, checks current directory access, and catches up from the saved journal position. A missing, damaged, or outdated snapshot triggers a rebuild. When the account cannot read the volume or its journal, Velocity uses folder indexing automatically. Folder indexing remains the default.
 
 ### Everything comparison
 

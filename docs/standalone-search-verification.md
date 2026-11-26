@@ -20,7 +20,7 @@ The baseline UI asks for at least two characters and debounces edits by 150 ms. 
 | M6 · NTFS snapshot | Two disposable NTFS volumes passed the exact path and type comparison against independent walks. The opt-in reader captured each volume GUID, journal ID and starting USN before enumeration. It reconciled both hard-link names under the running account's access rules. A forced reader failure returned the same scoped results through folder indexing. |
 | M7 · NTFS journal | Replay catches up from the initial scan position and tails the journal while search is open. The Windows acceptance suite compares live changes with independent walks and checks that the open desktop query refreshes after directory and file renames. |
 | M8 · Folder changes | `ReadDirectoryChangesW` starts before the initial walk. Small file batches update affected entries. Overflow, directory moves, access changes and reconnects use a scoped walk. A real notification overflow converged to the expected manifest. A temporary SMB root recovered changes made while disconnected, and a separate local root stayed searchable. [Microsoft directory notification documentation](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-readdirectorychangesw) |
-| M9 · Persistence | Checkpoint validation rejects a mismatched volume, a changed journal ID and out-of-range USNs. Atomic disk snapshots and interrupted-save recovery remain open. Folder mode scans current files at startup. |
+| M9 · Persistence | Versioned per-volume snapshots and their journal cursors are saved together. A disposable-volume run verified restart, offline edits, an interrupted save, access and exclusion changes, journal wrap, corruption, and a different volume at the original drive letter. A healthy volume remained searchable during recovery. |
 | M10 · Desktop controls | The desktop smoke opened the correct Unicode file and observed the active query refresh and an unavailable root becoming ready. Provider tests cover pause, resume, and monitor shutdown. The full keyboard, tray, hotkey and Retry acceptance run remains open. |
 | M11 · Release performance | Both corpus sizes were exercised. See the benchmark results below for the budgets and the remaining measurements. |
 | M12 · Standalone release | Native folder search is the default. Everything is available with the `everything` Cargo feature and a matching configuration setting. The default dependency graph and ZIP contents were inspected. Clean-VM installation and release sign-off remain open. |
@@ -33,7 +33,7 @@ Run the locked workspace tests and the optional desktop build check with `cargo 
 
 The x64 ZIP was built with Rust 1.97.1 from the working tree based on `b6ed6f4`. It contains `velocity-ui.exe` and `config.example.toml`. SHA-256 `97C012B4F42E18B63652FBD74AD4ACA45B9C127C75332B31DC2A90F7FE360DB2`. The default desktop dependency graph contains `velocity-native` and omits both the Everything adapter and experimental MFT parser. The optional Everything build passed its type check. The candidate links the MSVC runtime statically, and the executable import list contains only Windows system libraries. [Microsoft C++ deployment options](https://learn.microsoft.com/en-us/cpp/windows/deployment-in-visual-cpp)
 
-Release decision remains pending. The development package is usable for folder search. Persistence and clean-VM release acceptance remain open.
+Release decision remains pending. The development package is usable for folder search. Clean-VM release acceptance remains open.
 
 The locked workspace suite passed 30 tests. The opt-in Windows tests for the junction fixture, live ACL changes and two-volume NTFS snapshot passed separately. Clippy passed with warnings denied for `velocity-native` and `velocity-ui`.
 
@@ -103,6 +103,18 @@ Run the SMB test from an elevated Windows PowerShell with the Windows Server ser
 ```
 
 On 24 November 2026, both tests passed. The SMB root became unavailable and its old results disappeared. Reconnecting recovered the changed files while the independent local root stayed ready and searchable. Restarting the provider also picked up changes made while it was stopped.
+
+## M9 NTFS persistence and recovery acceptance
+
+Run from the repository root in elevated Windows PowerShell. The runner creates three disposable virtual disks and a private cache under `target`. It verifies disk identities before formatting or reusing a drive letter and deletes the images afterward. [Microsoft virtual disk mounting documentation](https://learn.microsoft.com/powershell/module/storage/mount-diskimage?view=windowsserver2025-ps)
+
+```powershell
+./tools/verify-ntfs-snapshot.ps1 -Persistence
+```
+
+On 26 November 2026, each recovered index matched an independent directory walk, including its exact count. A child process exited after flushing a temporary save and before replacing the committed file. Restart kept the old file and replayed offline edits. A real NTFS journal wrap moved the first readable USN to 19,922,944, past the saved cursor of 29,744. Tests also rejected a mismatched journal ID and a damaged checksum. The healthy volume returned results while the damaged volume was still rebuilding. A third disk mounted at the original drive letter built its own snapshot under its distinct volume identity. [Microsoft journal capacity and trimming documentation](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/fsutil-usn)
+
+Cache restores check the current directory visibility before serving results, including when the journal has no new records. Restore performance at the release corpus sizes remains part of M11.
 
 ## Release benchmark
 

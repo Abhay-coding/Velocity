@@ -11,7 +11,12 @@ use glob::{MatchOptions, Pattern};
 
 use crate::{Entry, RootCoverage, RootState};
 
-pub(crate) struct Exclusions(Vec<Pattern>);
+#[derive(Clone)]
+pub(crate) struct Exclusions {
+    patterns: Vec<Pattern>,
+    #[cfg(windows)]
+    cache_directory: Option<String>,
+}
 
 impl Exclusions {
     pub(crate) fn new(patterns: &[String]) -> Result<Self, glob::PatternError> {
@@ -19,17 +24,47 @@ impl Exclusions {
             .iter()
             .map(|pattern| Pattern::new(&pattern.replace('\\', "/")))
             .collect::<Result<Vec<_>, _>>()
-            .map(Self)
+            .map(|patterns| Self {
+                patterns,
+                #[cfg(windows)]
+                cache_directory: None,
+            })
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn exclude_cache(&mut self, directory: &Path) {
+        self.cache_directory = Some(cache_path_key(directory));
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn scope(&self) -> (Vec<String>, Option<String>) {
+        let patterns = self
+            .patterns
+            .iter()
+            .map(|pattern| pattern.as_str().to_owned())
+            .collect();
+        (patterns, self.cache_directory.clone())
     }
 
     pub(crate) fn matches(&self, path: &Path, is_directory: bool) -> bool {
+        #[cfg(windows)]
+        if let Some(cache) = &self.cache_directory {
+            let key = cache_path_key(path);
+            if key == *cache
+                || key
+                    .strip_prefix(cache)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+            {
+                return true;
+            }
+        }
         let normalized = path.to_string_lossy().replace('\\', "/");
         let options = MatchOptions {
             case_sensitive: false,
             require_literal_separator: true,
             require_literal_leading_dot: false,
         };
-        self.0.iter().any(|pattern| {
+        self.patterns.iter().any(|pattern| {
             pattern.matches_with(&normalized, options)
                 || (is_directory && pattern.matches_with(&format!("{normalized}/"), options))
         })
@@ -39,6 +74,18 @@ impl Exclusions {
         path.ancestors()
             .any(|ancestor| self.matches(ancestor, true))
     }
+}
+
+#[cfg(windows)]
+fn cache_path_key(path: &Path) -> String {
+    let key = path_key(path);
+    if let Some(unc) = key.strip_prefix("//?/unc/") {
+        return format!("//{}", unc.trim_end_matches('/'));
+    }
+    key.strip_prefix("//?/")
+        .unwrap_or(&key)
+        .trim_end_matches('/')
+        .into()
 }
 
 #[cfg(windows)]
@@ -270,7 +317,7 @@ pub(crate) fn scan(
     coverage
 }
 
-fn open_root(
+pub(crate) fn open_root(
     root: &Path,
     exclusions: &Exclusions,
     visited: &mut HashSet<PathBuf>,

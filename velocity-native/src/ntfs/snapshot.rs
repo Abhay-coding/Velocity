@@ -25,6 +25,8 @@ use crate::{
     Entry, RootCoverage,
 };
 
+pub(crate) mod disk;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ScopedLink {
     id: u64,
@@ -128,6 +130,7 @@ pub(crate) fn capture(
         exclusions,
         batch_bytes,
         &cancelled,
+        false,
     )? {
         *coverage = updated_coverage;
         snapshot = next;
@@ -150,6 +153,7 @@ pub(crate) fn tail(
         exclusions,
         batch_bytes,
         cancelled,
+        false,
     )
 }
 
@@ -160,13 +164,17 @@ fn advance(
     exclusions: &Exclusions,
     batch_bytes: usize,
     cancelled: impl Fn() -> bool,
+    validate_scope: bool,
 ) -> io::Result<Option<(ScopedSnapshot, RootCoverage)>> {
     let mut next = previous.clone();
     let mut coverage = coverage.clone();
     let mut changes = read_changes(reader, &mut next.checkpoint, batch_bytes, &cancelled)?;
-    if next.checkpoint == previous.checkpoint {
+    if next.checkpoint == previous.checkpoint && !validate_scope {
         return Ok(None);
     }
+    // A new process must verify its current visibility even if the journal
+    // was quiet. For example, group membership can change outside this volume.
+    changes.scope |= validate_scope;
     for _ in 0..4 {
         if changes.is_empty() {
             return Ok(Some((next, coverage)));
@@ -198,7 +206,9 @@ fn advance(
         };
         coverage.entries = links.len() as u64;
         next.hard_link_aliases = alias_count(&links);
-        next.links = Arc::new(links);
+        if links != *next.links {
+            next.links = Arc::new(links);
+        }
         changes = read_changes(reader, &mut next.checkpoint, batch_bytes, &cancelled)?;
     }
     if !changes.is_empty() {

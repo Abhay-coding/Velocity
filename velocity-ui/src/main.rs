@@ -242,7 +242,14 @@ fn main() -> VelocityResult<()> {
                 },
             )?;
             let native = Arc::new(if config.search.ntfs_snapshots {
-                native.with_ntfs_snapshots(velocity_native::ntfs::DEFAULT_BATCH_BYTES)
+                let native = native.with_ntfs_snapshots(velocity_native::ntfs::DEFAULT_BATCH_BYTES);
+                if let Some(local_data) = std::env::var_os("LOCALAPPDATA") {
+                    native.with_snapshot_cache(
+                        PathBuf::from(local_data).join("Velocity").join("index"),
+                    )
+                } else {
+                    native
+                }
             } else {
                 native
             });

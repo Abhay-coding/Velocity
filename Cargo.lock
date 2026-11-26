@@ -5605,8 +5605,10 @@ dependencies = [
 name = "velocity-native"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
  "glob",
  "memchr",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",
